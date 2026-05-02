@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "communityupdatechecker.h"
 #include "hexcomparedlg.h"
 #include "diffpanel.h"
 #include "savepoints/SavepointManager.h"
@@ -697,6 +698,50 @@ MainWindow::MainWindow(QWidget *parent)
         if (ApiClient::instance().isLoggedIn())
             ApiClient::instance().refreshEntitlements();
     });
+
+    // ── Community update check (silent, 5s after launch) ──────────────
+    {
+        auto *checker = new CommunityUpdateChecker(this);
+        connect(checker, &CommunityUpdateChecker::updateAvailable,
+                this, [this](const QString &ver, const QString &url) {
+            auto *bar = new QFrame(this);
+            bar->setStyleSheet(
+                "QFrame { background: #1a3a2a; border: 1px solid #238636;"
+                " border-radius: 6px; }");
+            auto *lay = new QHBoxLayout(bar);
+            lay->setContentsMargins(12, 6, 12, 6);
+            lay->setSpacing(8);
+            auto *icon = new QLabel("\u2B06");
+            icon->setStyleSheet("color: #3fb950; font-size: 14pt; background: transparent;");
+            auto *msg = new QLabel(
+                tr("Update available: <b>v%1</b>").arg(ver));
+            msg->setStyleSheet("color: #e6edf3; font-size: 10pt; background: transparent;");
+            msg->setTextFormat(Qt::RichText);
+            auto *btn = new QPushButton(tr("View on GitHub"));
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setStyleSheet(
+                "QPushButton { background: #238636; color: white; border: none;"
+                " border-radius: 4px; padding: 4px 12px; font-weight: bold; }"
+                "QPushButton:hover { background: #2ea043; }");
+            connect(btn, &QPushButton::clicked, this, [url]() {
+                QDesktopServices::openUrl(QUrl(url));
+            });
+            auto *dismiss = new QPushButton("\u2715");
+            dismiss->setFixedSize(20, 20);
+            dismiss->setCursor(Qt::PointingHandCursor);
+            dismiss->setStyleSheet(
+                "QPushButton { background: transparent; color: #8b949e;"
+                " border: none; font-size: 12pt; }"
+                "QPushButton:hover { color: #e6edf3; }");
+            connect(dismiss, &QPushButton::clicked, bar, &QWidget::deleteLater);
+            lay->addWidget(icon);
+            lay->addWidget(msg, 1);
+            lay->addWidget(btn);
+            lay->addWidget(dismiss);
+            statusBar()->addWidget(bar, 1);
+        });
+        QTimer::singleShot(5000, checker, &CommunityUpdateChecker::checkForUpdates);
+    }
 
     // ── Load saved language (retranslates UI if not English) ──────────
     QString lang = QSettings("CT14", "RX14")

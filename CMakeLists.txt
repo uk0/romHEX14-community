@@ -78,6 +78,8 @@ set(SOURCES
     src/aboutdialog.cpp
     src/aifunctionsdlg.cpp
     src/featuregate.h
+    src/communityupdatechecker.cpp
+    src/communityupdatechecker.h
     src/ecudetector.cpp
     src/romparser.cpp
     src/appconfig.cpp
