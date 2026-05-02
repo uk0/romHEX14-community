@@ -28,7 +28,7 @@
 
 <p align="center">
   <a href="https://github.com/ctabuyo/romHEX14-community/releases"><strong>Download Latest Release</strong></a>  ·  
-  <a href="https://gitee.com/ctabuyo/romHEX14-community">Gitee Mirror (中国镜像)</a>
+  <a href="https://gitee.com/liuyanpeng14/romHEX14-community">Gitee Mirror (中国镜像)</a>
 </p>
 
 ---
@@ -171,7 +171,7 @@ romHEX14-community/
 | Platform | URL | Notes |
 |---|---|---|
 | **GitHub** | [github.com/ctabuyo/romHEX14-community](https://github.com/ctabuyo/romHEX14-community) | Primary — PRs and Issues welcome |
-| **Gitee** | [gitee.com/ctabuyo/romHEX14-community](https://gitee.com/ctabuyo/romHEX14-community) | 中国镜像 — Issues also monitored |
+| **Gitee** | [gitee.com/ctabuyo/romHEX14-community](https://gitee.com/liuyanpeng14/romHEX14-community) | 中国镜像 — Issues also monitored |
 
 China users (中国用户): Gitee 镜像自动同步，建议使用 Gitee 获取更快下载速度。
 
