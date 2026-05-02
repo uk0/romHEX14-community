@@ -10,12 +10,13 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QVersionNumber>
 
 static const char kReleasesApi[] =
-    "https://api.github.com/repos/ctabuyo/romHEX14-community/releases/latest";
+    "https://api.github.com/repos/ctabuyo/romHEX14-community/releases";
 
 CommunityUpdateChecker::CommunityUpdateChecker(QObject *parent)
     : QObject(parent)
@@ -32,14 +33,23 @@ void CommunityUpdateChecker::checkForUpdates()
     auto *reply = m_nam->get(req);
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
         reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError)
+        if (reply->error() != QNetworkReply::NoError) {
+            qWarning() << "Update check failed:" << reply->errorString();
             return;
+        }
+        // qWarning() << "Update check: HTTP" << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
         const auto doc = QJsonDocument::fromJson(reply->readAll());
-        if (!doc.isObject())
+        QJsonObject obj;
+        if (doc.isArray()) {
+            const auto arr = doc.array();
+            if (arr.isEmpty()) return;
+            obj = arr.first().toObject();
+        } else if (doc.isObject()) {
+            obj = doc.object();
+        } else {
             return;
-
-        const auto obj = doc.object();
+        }
         QString tag = obj.value("tag_name").toString();
         const QString url = obj.value("html_url").toString();
 
@@ -57,6 +67,7 @@ void CommunityUpdateChecker::checkForUpdates()
 
         auto [remoteVer, remoteSuffix] = parseVer(tag);
         auto [localVer,  localSuffix]  = parseVer(QString::fromUtf8(RX14_VERSION_STRING));
+
 
         if (remoteVer.isNull() || localVer.isNull())
             return;
@@ -77,6 +88,7 @@ void CommunityUpdateChecker::checkForUpdates()
                 newer = (remoteSuffix > localSuffix); // lexicographic: beta4 > beta3
         }
 
+        // qWarning() << "Update check: newer=" << newer << "remoteSuffix=" << remoteSuffix << "localSuffix=" << localSuffix;
         if (newer)
             emit updateAvailable(tag, url);
     });
