@@ -363,6 +363,48 @@ AboutDialog::AboutDialog(QWidget *parent)
         cl->addWidget(eeCard);
     }
 
+    // ── Contributors ─────────────────────────────────────────────────────────
+    {
+        auto *contribCard = new QFrame();
+        contribCard->setObjectName("contribCard");
+        contribCard->setStyleSheet(
+            "QFrame#contribCard {"
+            "  background: #161b22;"
+            "  border: 1px solid #30363d;"
+            "  border-radius: 8px;"
+            "}");
+        auto *contribLay = new QVBoxLayout(contribCard);
+        contribLay->setContentsMargins(16, 12, 16, 12);
+        contribLay->setSpacing(8);
+
+        auto *contribTitle = new QLabel(tr("Contributors"));
+        contribTitle->setStyleSheet(
+            "color: #e6edf3; font-size: 12pt; font-weight: bold; background: transparent;");
+        contribLay->addWidget(contribTitle);
+
+        struct Contributor { QString name; QString desc; };
+        QVector<Contributor> contributors = {
+            { QStringLiteral("ogorek"),
+              tr("Edit ops, annotations, savepoints, diff panel, map fingerprint, bulk edit") },
+        };
+
+        for (const auto &c : contributors) {
+            auto *row = new QHBoxLayout();
+            row->setSpacing(8);
+            auto *nameLabel = new QLabel(QStringLiteral("\u2022 <b>%1</b>").arg(c.name));
+            nameLabel->setStyleSheet("color: #58a6ff; font-size: 10pt; background: transparent;");
+            nameLabel->setTextFormat(Qt::RichText);
+            auto *descLabel = new QLabel(QStringLiteral("\u2014 %1").arg(c.desc));
+            descLabel->setStyleSheet("color: #8b949e; font-size: 10pt; background: transparent;");
+            descLabel->setWordWrap(true);
+            row->addWidget(nameLabel);
+            row->addWidget(descLabel, 1);
+            contribLay->addLayout(row);
+        }
+
+        cl->addWidget(contribCard);
+    }
+
     cl->addStretch();
 
     // ── Footer ────────────────────────────────────────────────────────────────

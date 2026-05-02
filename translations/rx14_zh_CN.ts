@@ -1363,12 +1363,22 @@ Proceed?</source>
         <translation>十六进制编辑器，支持地图区域高亮显示</translation>
     </message>
     <message>
-        <location filename="../src/aboutdialog.cpp" line="372"/>
+        <location filename="../src/aboutdialog.cpp" line="380"/>
+        <source>Contributors</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../src/aboutdialog.cpp" line="388"/>
+        <source>Edit ops, annotations, savepoints, diff panel, map fingerprint, bulk edit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../src/aboutdialog.cpp" line="414"/>
         <source>© 2025 CT14 GARAGE CO., LTD — Bangkok, Thailand. All rights reserved.</source>
         <translation>© 2025 CT14 GARAGE CO., LTD — 泰国·曼谷。保留所有权利。</translation>
     </message>
     <message>
-        <location filename="../src/aboutdialog.cpp" line="378"/>
+        <location filename="../src/aboutdialog.cpp" line="420"/>
         <source>Close</source>
         <translation>关闭</translation>
     </message>

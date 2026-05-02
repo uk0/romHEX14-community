@@ -1363,12 +1363,22 @@ Motivo: %3
         <translation>Editor hexadecimal con resaltado de regiones de mapa</translation>
     </message>
     <message>
-        <location filename="../src/aboutdialog.cpp" line="372"/>
+        <location filename="../src/aboutdialog.cpp" line="380"/>
+        <source>Contributors</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../src/aboutdialog.cpp" line="388"/>
+        <source>Edit ops, annotations, savepoints, diff panel, map fingerprint, bulk edit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../src/aboutdialog.cpp" line="414"/>
         <source>© 2025 CT14 GARAGE CO., LTD — Bangkok, Thailand. All rights reserved.</source>
         <translation>© 2025 CT14 GARAGE CO., LTD — Bangkok, Tailandia. Todos los derechos reservados.</translation>
     </message>
     <message>
-        <location filename="../src/aboutdialog.cpp" line="378"/>
+        <location filename="../src/aboutdialog.cpp" line="420"/>
         <source>Close</source>
         <translation>Cerrar</translation>
     </message>
