@@ -3,7 +3,7 @@
  * Copyright (C) 2026 Cristian Tabuyo <contact@romhex14.com>
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Thin Qt6 Network client for the cloudfx API at https://ogorek.ftp.sh.
+ * Thin Qt6 Network client for the cloudfx API (user-configured server).
  *
  * Two tiers:
  *   - Free: /v1/dtc/analyze + /v1/dtc/disable (IP rate-limited, no auth)
