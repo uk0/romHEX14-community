@@ -142,12 +142,15 @@ set(SOURCES
     src/io/winols/SimilarityIndex.cpp
     src/io/winols/SimilarFilesDlg.cpp
     src/io/winols/BuildIndexProgressDlg.cpp
+    src/debug/DebugLog.cpp
 )
 
 # ── Debug RPC sources (gated by RX14_DEBUG_RPC) ─────────────────────────────
+# DebugLog (Q_LOGGING_CATEGORY definitions) is always compiled — release-mode
+# code paths use qCInfo(catFind) etc., they're free and don't drag in the RPC
+# server.  Only DebugRpc itself is gated.
 if(RX14_DEBUG_RPC)
     list(APPEND SOURCES
-        src/debug/DebugLog.cpp
         src/debug/DebugRpc.cpp
     )
 endif()
@@ -229,11 +232,11 @@ set(HEADERS
     src/io/winols/SimilarityIndex.h
     src/io/winols/SimilarFilesDlg.h
     src/io/winols/BuildIndexProgressDlg.h
+    src/debug/DebugLog.h
 )
 
 if(RX14_DEBUG_RPC)
     list(APPEND HEADERS
-        src/debug/DebugLog.h
         src/debug/DebugRpc.h
     )
 endif()
