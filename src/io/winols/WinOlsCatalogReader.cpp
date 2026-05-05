@@ -76,7 +76,7 @@ QDateTime toDateTime(const QVariant &v)
     constexpr qint64 kMin = 946684800;        // 2000-01-01 UTC
     constexpr qint64 kMax = 7258118400;       // ~2200-01-01 UTC
     if (ts < kMin || ts > kMax) return {};
-    return QDateTime::fromSecsSinceEpoch(ts, QTimeZone::UTC);
+    return QDateTime::fromSecsSinceEpoch(ts, Qt::UTC);
 }
 
 }  // namespace
