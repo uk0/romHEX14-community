@@ -2381,6 +2381,7 @@ void MainWindow::buildMenuBar()
     m_menuSel     = menuBar()->addMenu("");
     m_menuFind    = menuBar()->addMenu("");
     m_menuMisc    = menuBar()->addMenu("");
+    m_menuDatalog = menuBar()->addMenu("");
     m_menuWindow  = menuBar()->addMenu("");
     m_menuHelp    = menuBar()->addMenu("&?");
     // Add Preferences immediately so it's always in the menu
@@ -2476,6 +2477,7 @@ void MainWindow::retranslateUi()
     m_menuSel->setTitle(tr("&Selection"));
     m_menuFind->setTitle(tr("&Find"));
     m_menuMisc->setTitle(tr("&Miscellaneous"));
+    if (m_menuDatalog) m_menuDatalog->setTitle(tr("&Datalog"));
     m_menuWindow->setTitle(tr("&Window"));
     // m_menuHelp stays "&?"
 
@@ -2657,6 +2659,9 @@ void MainWindow::retranslateUi()
     m_menuFind->addAction(m_actDeleteComment);
     m_menuFind->addAction(m_actNextMarker);
     m_menuFind->addAction(m_actPrevMarker);
+
+    // ── Datalog menu ───────────────────────────────────────────────────
+    rebuildDatalogMenu();
 
     // ── Miscellaneous menu ────────────────────────────────────────────
         m_menuMisc->clear();
@@ -8981,6 +8986,96 @@ void MainWindow::runBulkEdit(const QVector<MapInfo> &maps)
     }
     statusBar()->showMessage(
         tr("Bulk edit applied to %1 maps").arg(maps.size()), 6000);
+}
+
+// ── Datalog menu wiring ─────────────────────────────────────────────────────
+
+#include "datalog/LogViewerWindow.h"
+#include "datalog/CompareLogsDialog.h"
+
+QStringList MainWindow::datalogRecent() const
+{
+    return rx14::appSettings().value(QStringLiteral("datalog/recent")).toStringList();
+}
+
+void MainWindow::datalogPushRecent(const QString &path)
+{
+    QStringList list = datalogRecent();
+    list.removeAll(path);
+    list.prepend(path);
+    while (list.size() > 10) list.removeLast();
+    rx14::appSettings().setValue(QStringLiteral("datalog/recent"), list);
+    rebuildDatalogMenu();
+}
+
+void MainWindow::openDatalog()
+{
+    QString p = QFileDialog::getOpenFileName(
+        this, tr("Open datalog"), QString(),
+        tr("Vehical logs (*.csv);;All files (*)"));
+    if (p.isEmpty()) return;
+
+    auto *w = new datalog::LogViewerWindow(this);
+    w->setAttribute(Qt::WA_DeleteOnClose);
+    QString err;
+    if (!w->openFile(p, &err)) {
+        QMessageBox::warning(this, tr("Open datalog"),
+                             tr("Failed to open %1:\n%2").arg(p, err));
+        w->deleteLater();
+        return;
+    }
+    datalogPushRecent(p);
+    w->show();
+}
+
+void MainWindow::compareDatalogs()
+{
+    auto *dlg = new datalog::CompareLogsDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+}
+
+void MainWindow::rebuildDatalogMenu()
+{
+    if (!m_menuDatalog) return;
+    m_menuDatalog->clear();
+
+    auto *openAct = m_menuDatalog->addAction(tr("&Open Log…"));
+    openAct->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+L")));
+    connect(openAct, &QAction::triggered, this, &MainWindow::openDatalog);
+
+    auto *cmpAct = m_menuDatalog->addAction(tr("&Compare Logs…"));
+    connect(cmpAct, &QAction::triggered, this, &MainWindow::compareDatalogs);
+
+    QStringList list = datalogRecent();
+    if (!list.isEmpty()) {
+        m_menuDatalog->addSeparator();
+        auto *recentMenu = m_menuDatalog->addMenu(tr("&Recent"));
+        for (const QString &p : list) {
+            auto *a = recentMenu->addAction(QFileInfo(p).fileName());
+            a->setToolTip(p);
+            const QString path = p;
+            connect(a, &QAction::triggered, this, [this, path]() {
+                auto *w = new datalog::LogViewerWindow(this);
+                w->setAttribute(Qt::WA_DeleteOnClose);
+                QString err;
+                if (!w->openFile(path, &err)) {
+                    QMessageBox::warning(this, tr("Open datalog"),
+                                         tr("Failed to open %1:\n%2").arg(path, err));
+                    w->deleteLater();
+                    return;
+                }
+                datalogPushRecent(path);
+                w->show();
+            });
+        }
+        recentMenu->addSeparator();
+        auto *clearAct = recentMenu->addAction(tr("&Clear list"));
+        connect(clearAct, &QAction::triggered, this, [this]() {
+            rx14::appSettings().remove(QStringLiteral("datalog/recent"));
+            rebuildDatalogMenu();
+        });
+    }
 }
 
 #ifdef RX14_DEBUG_RPC

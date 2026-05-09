@@ -298,9 +298,17 @@ private:
     QMenu *m_menuSel     = nullptr;
     QMenu *m_menuFind    = nullptr;
     QMenu *m_menuMisc    = nullptr;
+    QMenu *m_menuDatalog = nullptr;
     QMenu *m_menuLang    = nullptr;
     QMenu *m_menuWindow  = nullptr;
     QMenu *m_menuHelp    = nullptr;
+
+    // ── Datalog menu actions / state ──────────────────────────────────
+    void openDatalog();
+    void compareDatalogs();
+    void rebuildDatalogMenu();
+    QStringList datalogRecent() const;
+    void datalogPushRecent(const QString &path);
 
     // ── Per-map overlays ──────────────────────────────────────────────
     // Composite key: (Project*, mapName) so the same map name from

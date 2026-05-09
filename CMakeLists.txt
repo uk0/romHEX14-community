@@ -144,6 +144,18 @@ set(SOURCES
     src/io/winols/BuildIndexProgressDlg.cpp
     src/cloud/CloudClient.cpp
     src/cloud/CloudToolsDlg.cpp
+    src/datalog/LogTable.cpp
+    src/datalog/LogReader.cpp
+    src/datalog/CanonicalSignal.cpp
+    src/datalog/EcuFamily.cpp
+    src/datalog/ChannelAlias.cpp
+    src/datalog/UnitNormalizer.cpp
+    src/datalog/SidecarLoader.cpp
+    src/datalog/PullDetector.cpp
+    src/datalog/TimeSeriesPlotWidget.cpp
+    src/datalog/ChannelTreeWidget.cpp
+    src/datalog/LogViewerWindow.cpp
+    src/datalog/CompareLogsDialog.cpp
     src/debug/DebugLog.cpp
 )
 
@@ -236,6 +248,18 @@ set(HEADERS
     src/io/winols/BuildIndexProgressDlg.h
     src/cloud/CloudClient.h
     src/cloud/CloudToolsDlg.h
+    src/datalog/LogTable.h
+    src/datalog/LogReader.h
+    src/datalog/CanonicalSignal.h
+    src/datalog/EcuFamily.h
+    src/datalog/ChannelAlias.h
+    src/datalog/UnitNormalizer.h
+    src/datalog/SidecarLoader.h
+    src/datalog/PullDetector.h
+    src/datalog/TimeSeriesPlotWidget.h
+    src/datalog/ChannelTreeWidget.h
+    src/datalog/LogViewerWindow.h
+    src/datalog/CompareLogsDialog.h
     src/debug/DebugLog.h
 )
 
