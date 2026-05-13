@@ -1,5 +1,6 @@
 #pragma once
 #include <QMainWindow>
+#include <QPair>
 
 #include "LogTable.h"
 #include "EcuFamily.h"
@@ -27,6 +28,7 @@ private slots:
     void onChannelSelectionChanged(const QVector<int> &cols);
     void onPullClicked(int rowInList);
     void onCrosshairMoved(double timeMs);
+    void onCrosshairValues(double timeMs, const QVector<QPair<int,double>> &values);
     void onResetView();
 
 private:

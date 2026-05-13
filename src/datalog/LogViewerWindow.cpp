@@ -37,6 +37,8 @@ void LogViewerWindow::buildUi()
     setCentralWidget(m_plot);
     connect(m_plot, &TimeSeriesPlotWidget::crosshairMoved,
             this, &LogViewerWindow::onCrosshairMoved);
+    connect(m_plot, &TimeSeriesPlotWidget::crosshairValues,
+            this, &LogViewerWindow::onCrosshairValues);
 
     // Channel tree (left)
     m_tree = new ChannelTreeWidget(this);
@@ -250,7 +252,26 @@ void LogViewerWindow::onPullClicked(int rowInList)
 
 void LogViewerWindow::onCrosshairMoved(double timeMs)
 {
-    m_statusLabel->setText(QStringLiteral("t = %1 s").arg(timeMs / 1000.0, 0, 'f', 3));
+    Q_UNUSED(timeMs); // values are shown by onCrosshairValues
+}
+
+void LogViewerWindow::onCrosshairValues(double timeMs, const QVector<QPair<int,double>> &values)
+{
+    QStringList parts;
+    parts.append(QStringLiteral("t = %1 s").arg(timeMs / 1000.0, 0, 'f', 2));
+    for (const auto &v : values) {
+        if (v.first < 0 || v.first >= m_table.colCount()) continue;
+        const LogColumn &c = m_table.columns[v.first];
+        QString name = c.name;
+        if (name.length() > 12) name = name.left(10) + QStringLiteral("..");
+        double abs = std::abs(v.second);
+        int prec = (abs >= 100) ? 1 : (abs >= 1) ? 2 : 3;
+        parts.append(QStringLiteral("%1: %2 %3")
+                     .arg(name)
+                     .arg(v.second, 0, 'f', prec)
+                     .arg(c.unitRaw));
+    }
+    m_statusLabel->setText(parts.join(QStringLiteral("   ")));
 }
 
 void LogViewerWindow::onResetView()

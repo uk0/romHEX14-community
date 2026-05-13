@@ -2,6 +2,7 @@
 #include <QWidget>
 #include <QVector>
 #include <QColor>
+#include <QPair>
 
 namespace datalog {
 
@@ -19,6 +20,8 @@ public:
 
 signals:
     void crosshairMoved(double timeMs);
+    // Emitted with channel values at the crosshair: list of (columnIndex, value)
+    void crosshairValues(double timeMs, const QVector<QPair<int,double>> &values);
 
 protected:
     void paintEvent(QPaintEvent *e) override;
@@ -38,6 +41,9 @@ private:
     double m_pxToTime(int x, const QRect &plotArea) const;
     int    m_timeToPx(double t, const QRect &plotArea) const;
     void   drawTrack(QPainter &p, const QRect &row, int colIdx, const QColor &color);
+    void   drawCrosshairValue(QPainter &p, const QRect &row, int colIdx,
+                              const QColor &color, double y0, double y1);
+    double interpolateAt(int colIdx, double timeMs) const;
 };
 
 } // namespace datalog

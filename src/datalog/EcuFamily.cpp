@@ -1,23 +1,28 @@
 #include "EcuFamily.h"
 
+#include <QCoreApplication>
 #include <QSet>
 
 namespace datalog {
 
+#define TR(ctx, str) QCoreApplication::translate(ctx, str)
+
 QString familyName(EcuFamily f)
 {
     switch (f) {
-    case EcuFamily::BoschMercME:      return QStringLiteral("Bosch Mercedes ME");
-    case EcuFamily::BmwMedc17:        return QStringLiteral("BMW MEDC17");
-    case EcuFamily::PorscheSdi21:     return QStringLiteral("Porsche Continental SDI21");
-    case EcuFamily::PorscheOldSdi:    return QStringLiteral("Porsche older SDI / ME");
-    case EcuFamily::MercedesMeBlock:  return QStringLiteral("Mercedes ME (block-based)");
-    case EcuFamily::BmwMssS55:        return QStringLiteral("BMW MSS S55 (M3/M4 F8x)");
-    case EcuFamily::Autotuner:        return QStringLiteral("Autotuner (cloud)");
-    case EcuFamily::Unknown:          return QStringLiteral("Unknown");
+    case EcuFamily::BoschMercME:      return TR("Datalog", "Bosch Mercedes ME");
+    case EcuFamily::BmwMedc17:        return TR("Datalog", "BMW MEDC17");
+    case EcuFamily::PorscheSdi21:     return TR("Datalog", "Porsche Continental SDI21");
+    case EcuFamily::PorscheOldSdi:    return TR("Datalog", "Porsche older SDI / ME");
+    case EcuFamily::MercedesMeBlock:  return TR("Datalog", "Mercedes ME (block-based)");
+    case EcuFamily::BmwMssS55:        return TR("Datalog", "BMW MSS S55 (M3/M4 F8x)");
+    case EcuFamily::Autotuner:        return TR("Datalog", "Autotuner (cloud)");
+    case EcuFamily::Unknown:          return TR("Datalog", "Unknown");
     }
-    return QStringLiteral("Unknown");
+    return TR("Datalog", "Unknown");
 }
+
+#undef TR
 
 EcuFamily detectFamily(const LogTable &t)
 {
