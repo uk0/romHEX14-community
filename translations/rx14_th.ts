@@ -4441,8 +4441,8 @@ This may take a while (potentially hours for terabyte collections).  You can pau
     </message>
     <message>
         <location filename="../src/mainwindow.cpp" line="9015" />
-        <source>Vehicle logs (*.csv);;All files (*)</source>
-        <translation>บันทึกยานพาหนะ (*.csv);;ไฟล์ทั้งหมด (*)</translation>
+        <source>Vehical logs (*.csv);;All files (*)</source>
+        <translation>บันทึก Vehical (*.csv);;ไฟล์ทั้งหมด (*)</translation>
     </message>
     <message>
         <location filename="../src/mainwindow.cpp" line="9023" />
@@ -9541,8 +9541,8 @@ This cannot be undone.</translation>
     <message>
         <location filename="../src/datalog/CompareLogsDialog.cpp" line="61" />
         <location filename="../src/datalog/CompareLogsDialog.cpp" line="77" />
-        <source>Vehicle logs (*.csv);;All files (*)</source>
-        <translation>บันทึกยานพาหนะ (*.csv);;ไฟล์ทั้งหมด (*)</translation>
+        <source>Vehical logs (*.csv);;All files (*)</source>
+        <translation>บันทึก Vehical (*.csv);;ไฟล์ทั้งหมด (*)</translation>
     </message>
     <message>
         <location filename="../src/datalog/CompareLogsDialog.cpp" line="69" />

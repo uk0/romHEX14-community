@@ -9012,7 +9012,7 @@ void MainWindow::openDatalog()
 {
     QString p = QFileDialog::getOpenFileName(
         this, tr("Open datalog"), QString(),
-        tr("Vehicle logs (*.csv);;All files (*)"));
+        tr("Vehical logs (*.csv);;All files (*)"));
     if (p.isEmpty()) return;
 
     auto *w = new datalog::LogViewerWindow(this);
