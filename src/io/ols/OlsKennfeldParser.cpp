@@ -89,9 +89,22 @@ bool OlsKennfeldParser::isText(const char *data, int length)
 
 bool OlsKennfeldParser::isIdent(const QString &s)
 {
-    static const QRegularExpression re(
-        QStringLiteral("^[A-Za-z_][A-Za-z0-9_]{0,40}$"));
-    return re.match(s).hasMatch();
+    // Accept any printable map name that isn't obviously garbage.
+    // WinOLS map names can contain Latin, CJK, Cyrillic, umlauts, dots,
+    // brackets, hyphens, etc.  Reject only: empty, too long, or strings
+    // that are mostly control/whitespace characters.
+    if (s.isEmpty() || s.size() > 120) return false;
+
+    int printable = 0;
+    for (const QChar &ch : s) {
+        if (ch.unicode() < 0x20 && ch != QLatin1Char('\t'))
+            return false;   // control character = not a name
+        if (!ch.isSpace())
+            ++printable;
+    }
+    // Must have at least one non-whitespace character, and first char
+    // must not be a digit (avoids matching stray numeric fields).
+    return printable >= 1 && !s[0].isDigit();
 }
 
 
