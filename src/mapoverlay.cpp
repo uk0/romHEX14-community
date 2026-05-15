@@ -1206,8 +1206,18 @@ void MapOverlay::buildTable()
                             ? m_originalData : m_data;
     const auto *raw = reinterpret_cast<const uint8_t*>(src.constData());
     const int dlen  = src.size();
-    const int cols  = qMax(1, m_map.dimensions.x);
-    const int rows  = qMax(1, m_map.dimensions.y);
+    const int cols  = qBound(1, m_map.dimensions.x, 256);
+    const int rows  = qBound(1, m_map.dimensions.y, 256);
+    // If the originating dimensions are obviously broken, or the cells fall
+    // outside the ROM buffer, show an empty table rather than crashing.
+    if (m_map.dimensions.x > 256 || m_map.dimensions.y > 256
+        || dlen <= 0
+        || static_cast<qint64>(m_map.address) + qint64(rows) * cols * m_cellSize > dlen) {
+        m_table->setRowCount(0);
+        m_table->setColumnCount(0);
+        setWindowTitle(tr("%1 — not yet supported").arg(m_map.name));
+        return;
+    }
     const bool scaled = m_map.hasScaling
                         && m_map.scaling.type != CompuMethod::Type::Identical;
     const CompuMethod &cm = m_map.scaling;

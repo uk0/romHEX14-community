@@ -536,9 +536,12 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
     c.u32();
 
     auto [xSize, ySize] = classifyDims(kennfeldType, a276, a280, a396, a400);
-    if (xSize > static_cast<int>(DIM_A400_MAX) || ySize > static_cast<int>(DIM_A396_MAX))
-        return mi;
     if (xSize <= 0 || ySize <= 0)
+        return mi;
+    // Reject obviously implausible dimensions early so the display layer
+    // never sees a map it can't render.  ECU calibration maps top out well
+    // below these limits in practice.
+    if (xSize > 256 || ySize > 256 || (xSize * ySize) > 4096 * 4)
         return mi;
 
     auto label = c.cstr();
