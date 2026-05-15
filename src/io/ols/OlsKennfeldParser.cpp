@@ -67,6 +67,14 @@ static QString decodeOlsString(const char *p, int len)
     if (!utf8.hasError() && !asUtf8.contains(QChar::ReplacementCharacter))
         return asUtf8;
 
+    for (const char *enc : {"GB18030", "GBK", "Shift_JIS", "EUC-KR"}) {
+        QStringDecoder dec(enc);
+        if (!dec.isValid()) continue;
+        QString s = dec(raw);
+        if (!dec.hasError() && !s.contains(QChar::ReplacementCharacter))
+            return s;
+    }
+
     QStringDecoder cp1252("Windows-1252");
     if (cp1252.isValid()) return cp1252(raw);
 
