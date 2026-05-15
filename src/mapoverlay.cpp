@@ -1221,9 +1221,10 @@ void MapOverlay::buildTable()
         for (int c = 0; c < cols; ++c) {
             uint32_t off = m_map.address + m_map.mapDataOffset
                            + uint32_t(colMaj ? c * rows + r : r * cols + c) * m_cellSize;
-            uint32_t v = readRomValue(raw, dlen, off, m_cellSize, m_byteOrder);
+            const ByteOrder cellBO = cellByteOrder(m_map, m_byteOrder);
+            uint32_t v = readRomValue(raw, dlen, off, m_cellSize, cellBO);
             rawV[r][c] = v;
-            double sv = m_map.dataSigned ? readRomValueAsDouble(raw, dlen, off, m_cellSize, m_byteOrder, true) : double(v);
+            double sv = m_map.dataSigned ? readRomValueAsDouble(raw, dlen, off, m_cellSize, cellBO, true) : double(v);
             double p = scaled ? cm.toPhysical(sv) : sv;
             physV[r][c] = p;
             if (p < minP) minP = p;
@@ -1267,7 +1268,7 @@ void MapOverlay::buildTable()
             rv = ax.fixedValues[idx]; have = true;
         } else if (ax.hasPtsAddress && idx < ax.ptsCount) {
             uint32_t off = ax.ptsAddress + uint32_t(idx) * ax.ptsDataSize;
-            rv = readRomValueAsDouble(raw, dlen, off, ax.ptsDataSize, m_byteOrder, ax.ptsSigned);
+            rv = readRomValueAsDouble(raw, dlen, off, ax.ptsDataSize, axisByteOrder(ax, m_byteOrder), ax.ptsSigned);
             have = true;
         }
         if (!have) return QString::number(idx);
@@ -1306,7 +1307,7 @@ void MapOverlay::buildTable()
                 uint32_t origOff = m_map.address + m_map.mapDataOffset
                                    + uint32_t(colMaj ? c * rows + r : r * cols + c) * m_cellSize;
                 uint32_t origV = readRomValue(origRaw, m_originalData.size(),
-                                              origOff, m_cellSize, m_byteOrder);
+                                              origOff, m_cellSize, cellByteOrder(m_map, m_byteOrder));
                 modified = (origV != rv);
             }
 
@@ -1371,7 +1372,8 @@ CellEdit MapOverlay::writeCell(int row, int col, double newPhys)
     const CompuMethod &cm = m_map.scaling;
 
     const auto *src = reinterpret_cast<const uint8_t*>(m_data.constData());
-    uint32_t oldRaw = readRomValue(src, m_data.size(), offset, m_cellSize, m_byteOrder);
+    const ByteOrder cellBO = cellByteOrder(m_map, m_byteOrder);
+    uint32_t oldRaw = readRomValue(src, m_data.size(), offset, m_cellSize, cellBO);
 
     double rawD = scaled ? cm.toRaw(newPhys) : newPhys;
     uint32_t newRaw;
@@ -1390,11 +1392,11 @@ CellEdit MapOverlay::writeCell(int row, int col, double newPhys)
     }
 
     auto *dst = reinterpret_cast<uint8_t*>(m_data.data());
-    writeRomValue(dst, m_data.size(), offset, m_cellSize, m_byteOrder, newRaw);
+    writeRomValue(dst, m_data.size(), offset, m_cellSize, cellBO, newRaw);
 
     QByteArray patch(m_cellSize, '\0');
     writeRomValue(reinterpret_cast<uint8_t*>(patch.data()), m_cellSize,
-                  0, m_cellSize, m_byteOrder, newRaw);
+                  0, m_cellSize, cellBO, newRaw);
     emit romPatchReady(offset, patch);
 
     return {offset, oldRaw, newRaw};
@@ -1433,8 +1435,9 @@ void MapOverlay::applyBatchOp(int mode)
         uint32_t off = m_map.address + m_map.mapDataOffset
                        + uint32_t(m_map.columnMajor ? s.col * rows + s.row : s.row * cols + s.col) * m_cellSize;
         const auto *raw = reinterpret_cast<const uint8_t*>(m_data.constData());
-        uint32_t rv = readRomValue(raw, m_data.size(), off, m_cellSize, m_byteOrder);
-        double sv = m_map.dataSigned ? readRomValueAsDouble(raw, m_data.size(), off, m_cellSize, m_byteOrder, true) : double(rv);
+        const ByteOrder cellBO = cellByteOrder(m_map, m_byteOrder);
+        uint32_t rv = readRomValue(raw, m_data.size(), off, m_cellSize, cellBO);
+        double sv = m_map.dataSigned ? readRomValueAsDouble(raw, m_data.size(), off, m_cellSize, cellBO, true) : double(rv);
         double phys = scaled ? cm.toPhysical(sv) : sv;
 
         double newPhys;
@@ -1479,8 +1482,9 @@ void MapOverlay::openInlineEditor(const QString &prefill)
         uint32_t off = m_map.address + m_map.mapDataOffset
                        + uint32_t(m_map.columnMajor ? m_editCol * rows + m_editRow : m_editRow * cols2 + m_editCol) * m_cellSize;
         const auto *raw = reinterpret_cast<const uint8_t*>(m_data.constData());
-        uint32_t rv = readRomValue(raw, m_data.size(), off, m_cellSize, m_byteOrder);
-        double sv = m_map.dataSigned ? readRomValueAsDouble(raw, m_data.size(), off, m_cellSize, m_byteOrder, true) : double(rv);
+        const ByteOrder cellBO = cellByteOrder(m_map, m_byteOrder);
+        uint32_t rv = readRomValue(raw, m_data.size(), off, m_cellSize, cellBO);
+        double sv = m_map.dataSigned ? readRomValueAsDouble(raw, m_data.size(), off, m_cellSize, cellBO, true) : double(rv);
         double phys = scaled ? m_map.scaling.toPhysical(sv) : sv;
         m_inlineEdit->setText(scaled ? m_map.scaling.formatValue(phys) : QString::number(sv));
         m_inlineEdit->selectAll();
@@ -1637,8 +1641,9 @@ void MapOverlay::incrementSelectedCells(int delta)
         uint32_t off = m_map.address + m_map.mapDataOffset
                        + uint32_t(m_map.columnMajor ? s.col * rows + s.row : s.row * cols + s.col) * m_cellSize;
         const auto *raw = reinterpret_cast<const uint8_t*>(m_data.constData());
-        uint32_t rv = readRomValue(raw, m_data.size(), off, m_cellSize, m_byteOrder);
-        double sv = m_map.dataSigned ? readRomValueAsDouble(raw, m_data.size(), off, m_cellSize, m_byteOrder, true) : double(rv);
+        const ByteOrder cellBO = cellByteOrder(m_map, m_byteOrder);
+        uint32_t rv = readRomValue(raw, m_data.size(), off, m_cellSize, cellBO);
+        double sv = m_map.dataSigned ? readRomValueAsDouble(raw, m_data.size(), off, m_cellSize, cellBO, true) : double(rv);
         double phys = scaled ? cm.toPhysical(sv) : sv;
         double newPhys = phys + delta;
         batch.append(writeCell(s.row, s.col, newPhys));
@@ -1912,11 +1917,12 @@ void MapOverlay::undoEdit()
     cancelInlineEditor();
     EditBatch batch = m_undoStack.takeLast();
     auto *dst = reinterpret_cast<uint8_t*>(m_data.data());
+    const ByteOrder cellBO = cellByteOrder(m_map, m_byteOrder);
     for (const auto &e : batch) {
-        writeRomValue(dst, m_data.size(), e.offset, m_cellSize, m_byteOrder, e.oldRaw);
+        writeRomValue(dst, m_data.size(), e.offset, m_cellSize, cellBO, e.oldRaw);
         QByteArray patch(m_cellSize, '\0');
         writeRomValue(reinterpret_cast<uint8_t*>(patch.data()), m_cellSize,
-                      0, m_cellSize, m_byteOrder, e.oldRaw);
+                      0, m_cellSize, cellBO, e.oldRaw);
         emit romPatchReady(e.offset, patch);
     }
     m_redoStack.append(batch);
@@ -1931,11 +1937,12 @@ void MapOverlay::redoEdit()
     cancelInlineEditor();
     EditBatch batch = m_redoStack.takeLast();
     auto *dst = reinterpret_cast<uint8_t*>(m_data.data());
+    const ByteOrder cellBO = cellByteOrder(m_map, m_byteOrder);
     for (const auto &e : batch) {
-        writeRomValue(dst, m_data.size(), e.offset, m_cellSize, m_byteOrder, e.newRaw);
+        writeRomValue(dst, m_data.size(), e.offset, m_cellSize, cellBO, e.newRaw);
         QByteArray patch(m_cellSize, '\0');
         writeRomValue(reinterpret_cast<uint8_t*>(patch.data()), m_cellSize,
-                      0, m_cellSize, m_byteOrder, e.newRaw);
+                      0, m_cellSize, cellBO, e.newRaw);
         emit romPatchReady(e.offset, patch);
     }
     m_undoStack.append(batch);

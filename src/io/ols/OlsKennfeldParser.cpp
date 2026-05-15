@@ -90,7 +90,7 @@ bool OlsKennfeldParser::isText(const char *data, int length)
 bool OlsKennfeldParser::isIdent(const QString &s)
 {
     // Accept any printable map name that isn't obviously garbage.
-    // WinOLS map names can contain Latin, CJK, Cyrillic, umlauts, dots,
+    // Map names can contain Latin, CJK, Cyrillic, umlauts, dots,
     // brackets, hyphens, etc.  Reject only: empty, too long, or strings
     // that are mostly control/whitespace characters.
     if (s.isEmpty() || s.size() > 120) return false;
@@ -349,13 +349,14 @@ static AxisResult readAxis(const QByteArray &buf, qsizetype axisStart,
     uint32_t axisType       = OlsKennfeldParser::peekU32(buf, o); o += 4;
     uint32_t axisRomAddress = OlsKennfeldParser::peekU32(buf, o); o += 4;
     uint32_t axisDataType   = OlsKennfeldParser::peekU32(buf, o); o += 4;
+    o += 4;
     uint32_t cellBits       = OlsKennfeldParser::peekU32(buf, o); o += 4;
 
     if (cellBits != 2 && cellBits != 10 && cellBits != 16)
         cellBits = 10;
 
     if (o + 2 > buf.size()) return result;
-
+    o += 2;
 
     if (schema >= 264) {
         if (o + 8 > buf.size()) return result;
@@ -464,11 +465,12 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
     MapInfo mi;
     Cursor c(data, commentOffset, schema);
 
-    auto cm = c.cfr();
-    if (!cm.valid()) return mi;
-    if (envelopeStrings().contains(cm.name)) return mi;
-    if (cm.name.startsWith(QStringLiteral("Imported from"))) return mi;
-    if (!cm.name.isEmpty() && !isText(cm.name.toLatin1().constData(), cm.name.size()))
+    auto comment = c.cfr();
+    if (!comment.valid()) return mi;
+    if (envelopeStrings().contains(comment.name)) return mi;
+    if (comment.name.startsWith(QStringLiteral("Imported from"))) return mi;
+    if (!comment.name.isEmpty()
+        && !isText(comment.name.toLatin1().constData(), comment.name.size()))
         return mi;
 
     if (c.remain() < 20) return mi;
@@ -496,6 +498,7 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
     if (schema >= 94)  c.u32();
     if (schema >= 74)  c.bool1();
 
+    // Inner archive subtype defaults to 1; the gate-123 u32 fires for every .ols.
     if (schema >= 123)
         c.u32();
 
@@ -530,17 +533,17 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
     if (xSize <= 0 || ySize <= 0)
         return mi;
 
-    auto a568 = c.cstr();
-    auto a576 = c.cstr();
-    if (!a568.valid() || !a576.valid()) return mi;
+    auto label = c.cstr();
+    auto unit  = c.cstr();
+    if (!label.valid() || !unit.valid()) return mi;
 
     double scale  = c.f64();
     double offset = c.f64();
     uint32_t romAddress = c.u32();
-    uint32_t a640 = c.u32();
-    c.u32();
+    uint32_t romEnd     = c.u32();
+    uint32_t universalBase = c.u32();  // a2+644 ("Base Address" / virtual flash end)
 
-    QString physUnit = !a576.text.isEmpty() ? a576.text : a568.text;
+    QString physUnit = !unit.text.isEmpty() ? unit.text : label.text;
 
     if (schema >= 264) c.f64();
     if (schema >= 61)  c.u32();
@@ -548,35 +551,81 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
         c.u32(); c.u32(); c.u32(); c.u32();
     }
 
-    auto rowsAxis = readAxis(data, c.off, schema, ySize);
-    if (!rowsAxis.valid()) return mi;
-    c.off = rowsAxis.endOffset;
+    auto rowsAxisRes = readAxis(data, c.off, schema, ySize);
+    if (!rowsAxisRes.valid()) return mi;
+    c.off = rowsAxisRes.endOffset;
 
-    auto colsAxis = readAxis(data, c.off, schema, xSize);
-    if (!colsAxis.valid()) return mi;
-    c.off = colsAxis.endOffset;
+    auto colsAxisRes = readAxis(data, c.off, schema, xSize);
+    if (!colsAxisRes.valid()) return mi;
+    c.off = colsAxisRes.endOffset;
+    qsizetype axesEnd = c.off;
 
-    qsizetype trailerSearchStart = c.off;
-    qsizetype trailerSearchEnd = qMin(hardLimit, trailerSearchStart + 0x800);
-    qsizetype trailer = -1;
+    // Post-axis tail — walk version-gated fields in order.
+    // On any failure fall back to the inter-record 01 01 01 trailer scan.
+    bool tailOk = true;
+    auto skip = [&](int n) {
+        if (!tailOk) return;
+        if (c.off + n > data.size()) { tailOk = false; return; }
+        c.off += n;
+    };
+    auto cstr = [&]() {
+        if (!tailOk) return;
+        auto r = OlsKennfeldParser::readCString(data, c.off, 8192, schema);
+        if (!r.valid()) { tailOk = false; return; }
+        c.off = r.endOffset;
+    };
+
+    if (schema >= 58)  skip(1);
+    if (schema >= 68)  skip(1);
+    if (schema >= 90)  skip(4);
+    if (schema >= 9)   skip(8);
+    if (schema >= 49)  skip(4 + 1 + 1 + 8 + 8);
+    if (schema >= 51)  skip(4);
+    if (schema >= 53)  skip(1 + 8 + 8 + 8 + 4);
+    if (schema >= 54)  skip(8);
+    if (schema >= 55)  skip(3);
+    if (schema >= 315) skip(4);
+    if (schema >= 383) skip(4 + 16);
+    if (schema >= 329) skip(4);
+    if (schema >= 346) skip(8);
+    if (schema >= 395) skip(4);
+    if (tailOk && schema >= 476) {
+        skip(4);
+        if (tailOk && c.off + 4 <= data.size()) {
+            uint32_t dwCount = peekU32(data, c.off); c.off += 4;
+            if (dwCount <= 0x10000) skip(static_cast<int>(dwCount) * 4);
+            else tailOk = false;
+        } else tailOk = false;
+        if (tailOk && c.off + 4 <= data.size()) {
+            uint32_t strCount = peekU32(data, c.off); c.off += 4;
+            if (strCount <= 0x10000) {
+                for (uint32_t i = 0; i < strCount && tailOk; ++i) cstr();
+            } else tailOk = false;
+        } else tailOk = false;
+    }
+    if (schema >= 503) skip(4 + 8);
+    if (schema >= 596) skip(4);
+
+    qsizetype searchStart = tailOk ? c.off : axesEnd;
+    qsizetype recordEnd = qMin(searchStart, hardLimit);
     {
         const char *d = data.constData();
-        for (qsizetype i = trailerSearchStart; i + 3 <= trailerSearchEnd; ++i) {
+        qsizetype searchEnd = qMin(hardLimit, searchStart + 0x800);
+        for (qsizetype i = searchStart; i + 3 <= searchEnd; ++i) {
             if (static_cast<uint8_t>(d[i]) == 0x01
                 && static_cast<uint8_t>(d[i+1]) == 0x01
                 && static_cast<uint8_t>(d[i+2]) == 0x01) {
-                trailer = i;
+                recordEnd = i + 3;
                 break;
             }
         }
     }
 
-    qsizetype recordEnd = (trailer >= 0) ? trailer + 3 : c.off;
-
     mi.name = name;
-    mi.description = cm.name;
+    mi.description = comment.name;
     mi.rawAddress = romAddress;
     mi.address = romAddress;
+    mi.olsUniversalBase = universalBase;
     mi.dimensions = { xSize, ySize };
 
     auto bytesFromDataType = [](uint32_t dt) -> int {
@@ -596,7 +645,6 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
         derivedCellBytes = bytesFromDataType(cellDataType);
     } else {
         derivedCellBytes = cellBitsToBytes(cellBits);
-        uint32_t romEnd = a640;
         if (romAddress > 0 && romEnd > romAddress && xSize > 0 && ySize > 0) {
             uint32_t dataBytes = romEnd - romAddress;
             int totalCells = xSize * ySize;
@@ -640,9 +688,9 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
     if (!physUnit.isEmpty())
         mi.scaling.unit = physUnit;
 
-    mi.xAxis = colsAxis.axis;
+    mi.xAxis = colsAxisRes.axis;
     if (ySize > 1)
-        mi.yAxis = rowsAxis.axis;
+        mi.yAxis = rowsAxisRes.axis;
 
     mi.length = static_cast<int>(recordEnd - commentOffset);
 

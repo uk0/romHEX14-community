@@ -14,6 +14,7 @@
 #include "OlsRomExtractor.h"
 #include "OlsKennfeldParser.h"
 
+#include <QHash>
 #include <QtEndian>
 #include <cstring>
 
@@ -93,6 +94,40 @@ OlsImportResult OlsImporter::importFromBytes(const QByteArray &fileData)
         ver.maps = maps;
         result.versions.append(std::move(ver));
     } else {
+        // When map records share a uniform virtual base address, treat the
+        // file tail of length universalBase as the assembled ROM so rom_addr
+        // indexes it directly.  Gated on formatVersion >= 440 where the
+        // legacy segment layout no longer aligns with the stored rom_addr.
+        uint32_t sharedUniversalBase = 0;
+        bool universalBaseConsistent = false;
+        if (fmtVer >= 440) {
+            QHash<uint32_t, int> counts;
+            int considered = 0;
+            for (const auto &m : maps) {
+                if (m.olsUniversalBase != 0 && m.olsUniversalBase != 0xFFFFFFFF
+                    && m.rawAddress != 0 && m.rawAddress != 0xFFFFFFFF
+                    && m.rawAddress < m.olsUniversalBase) {
+                    counts[m.olsUniversalBase]++;
+                    ++considered;
+                }
+            }
+            int bestCount = 0;
+            for (auto it = counts.constBegin(); it != counts.constEnd(); ++it) {
+                if (it.value() > bestCount) {
+                    bestCount = it.value();
+                    sharedUniversalBase = it.key();
+                }
+            }
+            // Apply only when overwhelmingly consistent (>=90% of qualifying maps),
+            // the file actually contains a tail of length sharedUniversalBase, and
+            // the rom_addr range of those maps falls inside the tail.
+            if (considered >= 4 && bestCount * 10 >= considered * 9
+                && static_cast<qsizetype>(sharedUniversalBase) > 0x1000
+                && static_cast<qsizetype>(sharedUniversalBase) <= fileData.size()) {
+                universalBaseConsistent = true;
+            }
+        }
+
         for (auto &rv : romVersions) {
             OlsVersion ver;
             ver.name = versionNames.value(rv.versionIndex,
@@ -108,6 +143,17 @@ OlsImportResult OlsImporter::importFromBytes(const QByteArray &fileData)
                     const uint32_t eff = seg.flashBase + seg.framingBytes;
                     if (eff < baseAddr)
                         baseAddr = eff;
+                }
+            }
+
+            // Universal-base override: replace assembled ROM with the file tail
+            // of length a644, so rom_addr (a624) indexes it directly.  Only fires
+            // when the per-record a644 is uniformly set across kennfeld records.
+            if (universalBaseConsistent && rv.versionIndex == 0) {
+                const qsizetype tailLen = sharedUniversalBase;
+                if (tailLen > 0 && tailLen <= fileData.size()) {
+                    ver.romData = fileData.right(tailLen);
+                    baseAddr = 0;
                 }
             }
 

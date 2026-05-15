@@ -156,13 +156,17 @@ struct MapInfo {
     bool columnMajor = false;  // true = COLUMN_DIR (x fastest), false = ROW_DIR (y fastest, Bosch default)
     QString userNotes;          // user-written comments, persisted in project file
 
-    // OLS format: drives the byte layoutub_7FF72EDDDED0 for CELL bytes
-    // (the analogue of AxisInfo::ptsDataType for cells).
-    // Sourced from kennfeld+152 (the AUTHORITATIVE cell data_type enum;
-    // see AXIS_CELLWIDTH_SCHEMA.md
-    // and the reverse engineering in KENNFELD_RECORD_SCHEMA.md).
-    // Same enum as AxisInfo::ptsDataType.  0 = "unknown / not from OLS format"
-    // (A2L imports leave this at 0 and rely on the dataSize/dataSigned pair).
+    // OLS format: virtual base address used by newer file versions to remap
+    // rom_addr -> file offset via file_pos = file_size - (base - rom_addr).
+    // 0 = unset.
+    uint32_t olsUniversalBase = 0;
+
+    // OLS format: byte layout enum for CELL data (analogue of
+    // AxisInfo::ptsDataType for cells). Values:
+    //   1/8/9 = u8; 2 = u16 BE; 3 = u16 LE; 4 = u32 BE; 5 = u32 LE;
+    //   6 = float BE; 7 = float LE; 10 = i64; 11 = u64 LE;
+    //   12 = double BE; 13 = double LE.
+    // 0 = unknown / not from OLS (A2L imports rely on dataSize/dataSigned).
     uint32_t cellDataType = 0;
     bool     cellBigEndian = false;  // true for BE variants of cellDataType
 
@@ -180,6 +184,18 @@ struct MapRegion {
 Q_DECLARE_METATYPE(MapInfo)
 
 enum class ByteOrder { BigEndian, LittleEndian };
+
+inline ByteOrder cellByteOrder(const MapInfo &m, ByteOrder projectBO) {
+    return m.cellDataType != 0
+        ? (m.cellBigEndian ? ByteOrder::BigEndian : ByteOrder::LittleEndian)
+        : projectBO;
+}
+
+inline ByteOrder axisByteOrder(const AxisInfo &a, ByteOrder projectBO) {
+    return a.ptsDataType != 0
+        ? (a.ptsBigEndian ? ByteOrder::BigEndian : ByteOrder::LittleEndian)
+        : projectBO;
+}
 
 // Read an unsigned value from ROM data at given offset
 inline uint32_t readRomValue(const uint8_t *data, int dataLen, uint32_t offset, int cellSize, ByteOrder bo) {
