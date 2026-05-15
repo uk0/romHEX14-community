@@ -275,7 +275,7 @@ public:
 // ═══════════════════════════════════════════════════════════════════════════════
 MapOverlay::MapOverlay(QWidget *parent)
     : QDialog(parent,
-              Qt::Window | Qt::WindowTitleHint |
+              Qt::Tool | Qt::WindowTitleHint |
               Qt::WindowCloseButtonHint | Qt::WindowMinMaxButtonsHint)
 {
     setWindowTitle(tr("Map"));

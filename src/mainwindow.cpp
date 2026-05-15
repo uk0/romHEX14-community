@@ -6718,10 +6718,13 @@ void MainWindow::showMapOverlay(const QByteArray &romData, const MapInfo &map,
     ov->showMap(romData, displayMap, byteOrder,
                 project ? project->originalData : QByteArray{});
 
-    // Differentiate overlay windows when the same map name is open from
-    // multiple projects (e.g. parent ROM vs linked ROM).
-    if (project)
-        ov->setWindowTitle(map.name + QStringLiteral("  \u2014  ") + project->displayName());
+    if (project) {
+        const QString &desc = displayMap.description;
+        QString title = desc.isEmpty() || desc == displayMap.name
+                          ? displayMap.name
+                          : displayMap.name + QStringLiteral("  \u2014  ") + desc;
+        ov->setWindowTitle(title);
+    }
 }
 
 void MainWindow::onMapActivated(const MapInfo &map, Project *project)
