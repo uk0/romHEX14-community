@@ -13,6 +13,8 @@
 #include "io/winols/SimilarityIndex.h"
 #include "io/winols/WinOlsConfig.h"
 #include "io/winols/OlsCfgParser.h"
+#include "io/legion/LegionDlg.h"
+#include "io/legion/Legion.h"
 #include "savepoints/SavepointsPanel.h"
 #include "debug/DebugLog.h"
 #include <QDockWidget>
@@ -2658,6 +2660,57 @@ void MainWindow::retranslateUi()
     m_menuFind->addSeparator();
     m_menuFind->addAction(tr("Find &Similar Files…"),
                           this, &MainWindow::actFindSimilarFiles);
+    m_menuFind->addAction(tr("Summon &LEGION…"), this, [this]() {
+        Project *p = activeProject();
+        if (!p || p->currentData.isEmpty()) {
+            statusBar()->showMessage(
+                tr("Open a project first to summon the legion."), 4000);
+            return;
+        }
+        auto *dlg = new legion::LegionDlg(p, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(dlg, &QDialog::accepted, this, [this, dlg, p]() {
+            const auto verdicts = dlg->selectedVerdicts();
+            if (verdicts.isEmpty()) return;
+
+            // Bounding box of touched bytes — single undo entry covers it.
+            uint32_t lo = std::numeric_limits<uint32_t>::max(), hi = 0;
+            for (const auto &v : verdicts) {
+                if (v.startAddr < lo) lo = v.startAddr;
+                if (v.endAddr   > hi) hi = v.endAddr;
+            }
+            if (hi < lo || hi >= uint32_t(p->currentData.size())) {
+                statusBar()->showMessage(
+                    tr("LEGION: nothing applicable in this ROM."), 4000);
+                return;
+            }
+            const int spanLen = int(hi - lo + 1);
+            const QByteArray before = p->currentData.mid(int(lo), spanLen);
+            int totalChanged = 0;
+            for (const auto &v : verdicts) {
+                totalChanged += legion::applyVerdict(p->currentData, v);
+            }
+            const QByteArray after = p->currentData.mid(int(lo), spanLen);
+
+            // Route through the WaveformEditor so the change lands as ONE
+            // undo entry alongside every other batch op the editor manages.
+            ProjectView *pv = activeView();
+            WaveformWidget *ww = pv ? pv->waveformWidget() : nullptr;
+            WaveformEditor *ed = ww ? ww->editor() : nullptr;
+            if (ed) {
+                ed->submitExternal(int(lo), before, after);
+            } else {
+                // No editor → mirror the change to listeners ourselves.
+                emit p->dataChanged();
+            }
+            statusBar()->showMessage(
+                tr("LEGION: %1 verdicts applied (%2 bytes changed). Ctrl+Z to undo.")
+                .arg(verdicts.size()).arg(totalChanged), 6000);
+        });
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
     m_menuFind->addSeparator();
     m_menuFind->addAction(m_actInsertComment);
     m_menuFind->addAction(m_actInsertMarker);

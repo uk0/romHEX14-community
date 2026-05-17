@@ -59,6 +59,16 @@ public:
     void endDraw();
     bool isDrawing() const { return m_drawing; }
 
+    // ── External batch ──────────────────────────────────────────────────
+    // Caller mutated `m_data[offset..offset+after.size())` already; this
+    // records a single undo entry with the supplied before/after spans
+    // and emits dataModified.  Used by LEGION submit to register a whole
+    // batch as ONE Ctrl-Z step.  `before` and `after` must have the same
+    // size and represent the buffer state at @p offset.
+    void submitExternal(int offset,
+                        const QByteArray &before,
+                        const QByteArray &after);
+
     // ── Undo / redo ─────────────────────────────────────────────────────
     bool canUndo() const;
     bool canRedo() const;

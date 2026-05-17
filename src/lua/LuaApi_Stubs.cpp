@@ -22,6 +22,7 @@
 #include "io/ols/EcuAutoDetect.h"
 #include "io/winols/SimilarityIndex.h"
 #include "io/winols/RomFingerprint.h"
+#include "io/legion/Legion.h"
 #include "romparser.h"
 
 #include "sol/sol.hpp"
@@ -1103,6 +1104,434 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         emit p->dataChanged();
         return true;
     });
+
+    // ── LEGION internal test bindings (M.1+) ──────────────────────────────
+    //
+    // These expose pieces of the legion:: pipeline so the Lua test harness
+    // can verify each stage in isolation.  They take/return Lua strings as
+    // byte buffers (sol2 maps QByteArray<->std::string cleanly).
+    //
+    // _legion_detectRegions(originalStr, stage1Str, kAdjacency)
+    //   → array of {startAddr, endAddr, size} tables
+    L.set_function("_legion_detectRegions",
+        [&L](const std::string &origStr, const std::string &stage1Str, int k) -> sol::table {
+            QByteArray orig  = QByteArray::fromStdString(origStr);
+            QByteArray stage = QByteArray::fromStdString(stage1Str);
+            auto regions = legion::detectRegions(orig, stage, k);
+            sol::table out = L.create_table();
+            for (int i = 0; i < regions.size(); ++i) {
+                sol::table row = L.create_table();
+                row["startAddr"] = double(regions[i].startAddr);
+                row["endAddr"]   = double(regions[i].endAddr);
+                row["size"]      = double(regions[i].endAddr - regions[i].startAddr + 1);
+                out[i + 1] = row;
+            }
+            return out;
+        });
+
+    // _legion_inferStructure(originalStr) → {cellSize, bigEndian, rows, cols, kind}
+    L.set_function("_legion_inferStructure",
+        [&L](const std::string &origStr) -> sol::table {
+            QByteArray bytes = QByteArray::fromStdString(origStr);
+            legion::LegionRegion region;
+            region.startAddr     = 0;
+            region.endAddr       = bytes.isEmpty() ? 0 : uint32_t(bytes.size() - 1);
+            region.originalBytes = bytes;
+            region.modifiedBytes = bytes;
+            const auto h = legion::inferStructure(region);
+            sol::table out = L.create_table();
+            out["cellSize"]  = h.cellSize;
+            out["bigEndian"] = h.bigEndian;
+            out["rows"]      = h.rows;
+            out["cols"]      = h.cols;
+            const char *kind = "Scalar";
+            switch (h.kind) {
+            case legion::VerdictKind::Scalar:   kind = "Scalar";   break;
+            case legion::VerdictKind::Curve:    kind = "Curve";    break;
+            case legion::VerdictKind::SmallMap: kind = "SmallMap"; break;
+            case legion::VerdictKind::LargeMap: kind = "LargeMap"; break;
+            }
+            out["kind"] = std::string(kind);
+            return out;
+        });
+
+    // _legion_clusterVoices(voicesTbl, jaccardMin?)
+    //   voicesTbl = {{sourcePath="...", addrs={a1, a2, ...}}, ...}
+    //   → array of {voiceIndices={1-based...}, label, addrRangeMin,
+    //               addrRangeMax, consensusAddrCount, memberCount}
+    L.set_function("_legion_clusterVoices",
+        [&L](sol::table voicesTbl, sol::optional<double> jaccardOpt) -> sol::table {
+            const double jacc = jaccardOpt.value_or(0.50);
+            QVector<legion::LegionVoice> voices;
+            voices.reserve(int(voicesTbl.size()));
+            for (std::size_t i = 1; i <= voicesTbl.size(); ++i) {
+                sol::table row = voicesTbl[i];
+                legion::LegionVoice v;
+                sol::optional<std::string> sp = row["sourcePath"];
+                if (sp) v.sourcePath = QString::fromStdString(*sp);
+                sol::optional<sol::table> addrs = row["addrs"];
+                if (addrs) {
+                    sol::table at = *addrs;
+                    for (std::size_t k = 1; k <= at.size(); ++k) {
+                        v.addressSet.insert(uint32_t(double(at[k])));
+                    }
+                }
+                voices.append(std::move(v));
+            }
+            const auto clusters = legion::clusterVoices(voices, jacc);
+            sol::table out = L.create_table();
+            for (int ci = 0; ci < clusters.size(); ++ci) {
+                const auto &c = clusters[ci];
+                sol::table row = L.create_table();
+                sol::table idx = L.create_table();
+                for (int k = 0; k < c.voiceIndices.size(); ++k) {
+                    idx[k + 1] = c.voiceIndices[k] + 1;     // 1-based for Lua
+                }
+                row["voiceIndices"]       = idx;
+                row["memberCount"]        = c.voiceIndices.size();
+                row["addrRangeMin"]       = double(c.addrRangeMin);
+                row["addrRangeMax"]       = double(c.addrRangeMax);
+                row["consensusAddrCount"] = c.consensusAddrCount;
+                row["label"]              = c.label.toStdString();
+                out[ci + 1] = row;
+            }
+            return out;
+        });
+
+    // _legion_aggregate(voicesTbl, baselineStr, clusterIndices, localSimMin?)
+    //   voicesTbl[i]   = {sourcePath="...", regions={{startAddr=, originalBytes="", modifiedBytes=""}, ...}}
+    //   clusterIndices = array of 1-based voice indices
+    //   → array of verdicts:
+    //     {startAddr, endAddr, cellSize, rows, cols, kind, maxSampleCount,
+    //      cells={{meanDelta, stdDevDelta, sampleCount}, ...},
+    //      contributingVoices={...}}
+    L.set_function("_legion_aggregate",
+        [&L](sol::table voicesTbl, const std::string &baselineStr,
+             sol::table clusterIdxTbl, sol::optional<double> simOpt) -> sol::table {
+            const QByteArray baseline = QByteArray::fromStdString(baselineStr);
+            const double sim = simOpt.value_or(0.90);
+
+            QVector<legion::LegionVoice> voices;
+            voices.reserve(int(voicesTbl.size()));
+            for (std::size_t i = 1; i <= voicesTbl.size(); ++i) {
+                sol::table row = voicesTbl[i];
+                legion::LegionVoice v;
+                sol::optional<std::string> sp = row["sourcePath"];
+                if (sp) v.sourcePath = QString::fromStdString(*sp);
+
+                sol::optional<sol::table> regs = row["regions"];
+                if (regs) {
+                    sol::table rt = *regs;
+                    for (std::size_t k = 1; k <= rt.size(); ++k) {
+                        sol::table rr = rt[k];
+                        legion::LegionRegion reg;
+                        reg.startAddr = uint32_t(double(rr["startAddr"]));
+                        sol::optional<std::string> ob = rr["originalBytes"];
+                        sol::optional<std::string> mb = rr["modifiedBytes"];
+                        if (ob) reg.originalBytes = QByteArray::fromStdString(*ob);
+                        if (mb) reg.modifiedBytes = QByteArray::fromStdString(*mb);
+                        reg.endAddr = reg.startAddr +
+                                      uint32_t(qMax(0, reg.originalBytes.size() - 1));
+                        // Populate addressSet for any byte where orig != modified.
+                        for (int b = 0; b < reg.originalBytes.size() &&
+                                        b < reg.modifiedBytes.size(); ++b) {
+                            if (reg.originalBytes[b] != reg.modifiedBytes[b]) {
+                                v.addressSet.insert(reg.startAddr + uint32_t(b));
+                            }
+                        }
+                        v.regions.append(std::move(reg));
+                    }
+                }
+                voices.append(std::move(v));
+            }
+
+            legion::VoiceCluster cluster;
+            for (std::size_t i = 1; i <= clusterIdxTbl.size(); ++i) {
+                cluster.voiceIndices.append(int(double(clusterIdxTbl[i])) - 1);
+            }
+
+            const auto verdicts = legion::aggregate(voices, baseline, cluster, sim);
+
+            sol::table out = L.create_table();
+            for (int vi = 0; vi < verdicts.size(); ++vi) {
+                const auto &v = verdicts[vi];
+                sol::table row = L.create_table();
+                row["startAddr"]      = double(v.startAddr);
+                row["endAddr"]        = double(v.endAddr);
+                row["cellSize"]       = v.cellSize;
+                row["rows"]           = v.rows;
+                row["cols"]           = v.cols;
+                row["maxSampleCount"] = v.maxSampleCount;
+                const char *kind = "Scalar";
+                switch (v.kind) {
+                case legion::VerdictKind::Scalar:   kind = "Scalar";   break;
+                case legion::VerdictKind::Curve:    kind = "Curve";    break;
+                case legion::VerdictKind::SmallMap: kind = "SmallMap"; break;
+                case legion::VerdictKind::LargeMap: kind = "LargeMap"; break;
+                }
+                row["kind"] = std::string(kind);
+
+                sol::table cellsTbl = L.create_table();
+                for (int ci = 0; ci < v.cells.size(); ++ci) {
+                    sol::table cell = L.create_table();
+                    cell["meanDelta"]   = v.cells[ci].meanDelta;
+                    cell["stdDevDelta"] = v.cells[ci].stdDevDelta;
+                    cell["sampleCount"] = v.cells[ci].sampleCount;
+                    cellsTbl[ci + 1] = cell;
+                }
+                row["cells"] = cellsTbl;
+
+                sol::table cvTbl = L.create_table();
+                for (int k = 0; k < v.contributingVoices.size(); ++k) {
+                    cvTbl[k + 1] = v.contributingVoices[k] + 1;   // 1-based
+                }
+                row["contributingVoices"] = cvTbl;
+                out[vi + 1] = row;
+            }
+            return out;
+        });
+
+    // _legion_applyVerdict(dataStr, verdictTbl)
+    //   verdictTbl: {startAddr, cellSize, bigEndian, cells={{meanDelta, sampleCount}, ...}}
+    //   Returns the modified data string (Lua strings are immutable, so we
+    //   copy through a temporary QByteArray).
+    L.set_function("_legion_applyVerdict",
+        [](const std::string &dataStr, sol::table vt) -> std::string {
+            QByteArray data = QByteArray::fromStdString(dataStr);
+            legion::LegionVerdict v;
+            v.startAddr = uint32_t(double(vt["startAddr"]));
+            v.cellSize  = int(double(vt["cellSize"]));
+            sol::optional<bool> be = vt["bigEndian"];
+            v.bigEndian = be.value_or(false);
+            sol::table cellsTbl = vt["cells"];
+            v.cells.resize(int(cellsTbl.size()));
+            for (std::size_t k = 1; k <= cellsTbl.size(); ++k) {
+                sol::table cell = cellsTbl[k];
+                v.cells[int(k) - 1].meanDelta   = double(cell["meanDelta"]);
+                v.cells[int(k) - 1].sampleCount = int(double(cell["sampleCount"]));
+            }
+            v.endAddr = v.startAddr +
+                        uint32_t(qMax(0, v.cells.size() * v.cellSize - 1));
+            (void)legion::applyVerdict(data, v);
+            return data.toStdString();
+        });
+
+    // _legion_classify(verdictsTbl, totalVoicesInCluster)
+    //   verdictsTbl: array of verdicts as returned by _legion_aggregate
+    //                (uses .cells[].sampleCount/.meanDelta/.stdDevDelta).
+    //   Returns a NEW array of verdicts with tag (string) + consensusStrength
+    //   added/overwritten, sorted by consensusStrength descending.
+    L.set_function("_legion_classify",
+        [&L](sol::table verdictsTbl, int totalVoices) -> sol::table {
+            QVector<legion::LegionVerdict> verdicts;
+            verdicts.reserve(int(verdictsTbl.size()));
+            for (std::size_t i = 1; i <= verdictsTbl.size(); ++i) {
+                sol::table row = verdictsTbl[i];
+                legion::LegionVerdict v;
+                v.startAddr      = uint32_t(double(row["startAddr"]));
+                v.endAddr        = uint32_t(double(row["endAddr"]));
+                v.cellSize       = int(double(row["cellSize"]));
+                v.rows           = int(double(row["rows"]));
+                v.cols           = int(double(row["cols"]));
+                v.maxSampleCount = int(double(row["maxSampleCount"]));
+                sol::table cellsTbl = row["cells"];
+                v.cells.resize(int(cellsTbl.size()));
+                for (std::size_t k = 1; k <= cellsTbl.size(); ++k) {
+                    sol::table cell = cellsTbl[k];
+                    v.cells[int(k) - 1].meanDelta   = double(cell["meanDelta"]);
+                    v.cells[int(k) - 1].stdDevDelta = double(cell["stdDevDelta"]);
+                    v.cells[int(k) - 1].sampleCount = int(double(cell["sampleCount"]));
+                }
+                verdicts.append(std::move(v));
+            }
+
+            legion::classify(verdicts, totalVoices);
+
+            sol::table out = L.create_table();
+            for (int vi = 0; vi < verdicts.size(); ++vi) {
+                const auto &v = verdicts[vi];
+                sol::table row = L.create_table();
+                row["startAddr"]         = double(v.startAddr);
+                row["endAddr"]           = double(v.endAddr);
+                row["cellSize"]          = v.cellSize;
+                row["rows"]              = v.rows;
+                row["cols"]              = v.cols;
+                row["maxSampleCount"]    = v.maxSampleCount;
+                row["consensusStrength"] = v.consensusStrength;
+                const char *tag = "Heretic";
+                switch (v.tag) {
+                case legion::VerdictTag::Unanimous:       tag = "Unanimous";       break;
+                case legion::VerdictTag::StrongConsensus: tag = "StrongConsensus"; break;
+                case legion::VerdictTag::Majority:        tag = "Majority";        break;
+                case legion::VerdictTag::Contested:       tag = "Contested";       break;
+                case legion::VerdictTag::Heretic:         tag = "Heretic";         break;
+                case legion::VerdictTag::Checksum:        tag = "Checksum";        break;
+                case legion::VerdictTag::KillRegion:      tag = "KillRegion";      break;
+                }
+                row["tag"] = std::string(tag);
+                sol::table cellsTbl = L.create_table();
+                for (int k = 0; k < v.cells.size(); ++k) {
+                    sol::table cell = L.create_table();
+                    cell["meanDelta"]   = v.cells[k].meanDelta;
+                    cell["stdDevDelta"] = v.cells[k].stdDevDelta;
+                    cell["sampleCount"] = v.cells[k].sampleCount;
+                    cellsTbl[k + 1]     = cell;
+                }
+                row["cells"] = cellsTbl;
+                out[vi + 1] = row;
+            }
+            return out;
+        });
+
+    // ── LEGION.9 ─────────────────────────────────────────────────────────
+    //
+    // legionInvoke(opts) — one-shot end-to-end pipeline:
+    //   detectRegions → clusterVoices → for each cluster: aggregate +
+    //   classify.  Returns the full forest of clusters + classified verdicts.
+    //
+    // opts = {
+    //   baseline = "<bytes>",                 -- user ROM (Version 0)
+    //   voices   = {                          -- voice corpus
+    //       { sourcePath="...",
+    //         originalBytes="...",            -- voice's Version 0
+    //         modifiedBytes="..." },          -- voice's Version 1
+    //       ...
+    //   },
+    //   jaccardMin  = 0.50,                   -- voice clustering threshold
+    //   localSimMin = 0.90,                   -- per-region hamming gate
+    //   detectK     = 16,                     -- region adjacency window
+    // }
+    //
+    // returns = {
+    //   voices = N,                           -- voices accepted (non-empty diff)
+    //   clusters = {
+    //     { voiceIndices, memberCount, label, addrRangeMin, addrRangeMax,
+    //       consensusAddrCount,
+    //       verdicts = { ...one-shot aggregate+classify per cluster... } },
+    //     ...
+    //   }
+    // }
+    L.set_function("legionInvoke",
+        [&L](sol::table opts) -> sol::table {
+            sol::optional<std::string> bsOpt = opts["baseline"];
+            const QByteArray baseline = bsOpt
+                ? QByteArray::fromStdString(*bsOpt) : QByteArray();
+            const double jacc = sol::optional<double>(opts["jaccardMin"])
+                                    .value_or(0.50);
+            const double sim  = sol::optional<double>(opts["localSimMin"])
+                                    .value_or(0.90);
+            const int kAdj    = int(sol::optional<double>(opts["detectK"])
+                                    .value_or(16.0));
+
+            // 1) Ingest voices.
+            QVector<legion::LegionVoice> voices;
+            sol::optional<sol::table> voicesTbl = opts["voices"];
+            if (voicesTbl) {
+                sol::table vt = *voicesTbl;
+                voices.reserve(int(vt.size()));
+                for (std::size_t i = 1; i <= vt.size(); ++i) {
+                    sol::table row = vt[i];
+                    legion::LegionVoice v;
+                    sol::optional<std::string> sp = row["sourcePath"];
+                    if (sp) v.sourcePath = QString::fromStdString(*sp);
+                    sol::optional<std::string> ob = row["originalBytes"];
+                    sol::optional<std::string> mb = row["modifiedBytes"];
+                    if (!ob || !mb) { voices.append(std::move(v)); continue; }
+                    QByteArray orig = QByteArray::fromStdString(*ob);
+                    QByteArray mod  = QByteArray::fromStdString(*mb);
+                    v.regions = legion::detectRegions(orig, mod, kAdj);
+                    for (const auto &r : v.regions) {
+                        for (uint32_t a = r.startAddr; a <= r.endAddr; ++a) {
+                            if (a < uint32_t(orig.size()) &&
+                                a < uint32_t(mod.size()) &&
+                                orig[int(a)] != mod[int(a)]) {
+                                v.addressSet.insert(a);
+                            }
+                        }
+                    }
+                    if (!v.addressSet.isEmpty())
+                        voices.append(std::move(v));
+                }
+            }
+
+            // 2) Cluster.
+            const auto clusters = legion::clusterVoices(voices, jacc);
+
+            // 3) Per cluster: aggregate + classify (only multi-member).
+            sol::table out = L.create_table();
+            out["voices"] = voices.size();
+            sol::table clustersTbl = L.create_table();
+            for (int ci = 0; ci < clusters.size(); ++ci) {
+                const auto &c = clusters[ci];
+                sol::table row = L.create_table();
+                sol::table idxTbl = L.create_table();
+                for (int k = 0; k < c.voiceIndices.size(); ++k)
+                    idxTbl[k + 1] = c.voiceIndices[k] + 1;          // 1-based
+                row["voiceIndices"]       = idxTbl;
+                row["memberCount"]        = c.voiceIndices.size();
+                row["label"]              = c.label.toStdString();
+                row["addrRangeMin"]       = double(c.addrRangeMin);
+                row["addrRangeMax"]       = double(c.addrRangeMax);
+                row["consensusAddrCount"] = c.consensusAddrCount;
+
+                // Aggregate + classify (no-op for singletons but cheap).
+                QVector<legion::LegionVerdict> verdicts;
+                if (c.voiceIndices.size() >= 2 && !baseline.isEmpty()) {
+                    verdicts = legion::aggregate(voices, baseline, c, sim);
+                    legion::classify(verdicts, c.voiceIndices.size());
+                }
+                sol::table vsTbl = L.create_table();
+                for (int vi = 0; vi < verdicts.size(); ++vi) {
+                    const auto &v = verdicts[vi];
+                    sol::table vrow = L.create_table();
+                    vrow["startAddr"]         = double(v.startAddr);
+                    vrow["endAddr"]           = double(v.endAddr);
+                    vrow["cellSize"]          = v.cellSize;
+                    vrow["bigEndian"]         = v.bigEndian;
+                    vrow["rows"]              = v.rows;
+                    vrow["cols"]              = v.cols;
+                    vrow["maxSampleCount"]    = v.maxSampleCount;
+                    vrow["consensusStrength"] = v.consensusStrength;
+                    const char *kind = "Scalar";
+                    switch (v.kind) {
+                    case legion::VerdictKind::Scalar:   kind = "Scalar";   break;
+                    case legion::VerdictKind::Curve:    kind = "Curve";    break;
+                    case legion::VerdictKind::SmallMap: kind = "SmallMap"; break;
+                    case legion::VerdictKind::LargeMap: kind = "LargeMap"; break;
+                    }
+                    vrow["kind"] = std::string(kind);
+                    const char *tag = "Heretic";
+                    switch (v.tag) {
+                    case legion::VerdictTag::Unanimous:       tag = "Unanimous";       break;
+                    case legion::VerdictTag::StrongConsensus: tag = "StrongConsensus"; break;
+                    case legion::VerdictTag::Majority:        tag = "Majority";        break;
+                    case legion::VerdictTag::Contested:       tag = "Contested";       break;
+                    case legion::VerdictTag::Heretic:         tag = "Heretic";         break;
+                    case legion::VerdictTag::Checksum:        tag = "Checksum";        break;
+                    case legion::VerdictTag::KillRegion:      tag = "KillRegion";      break;
+                    }
+                    vrow["tag"] = std::string(tag);
+                    sol::table cellsTbl = L.create_table();
+                    for (int k = 0; k < v.cells.size(); ++k) {
+                        sol::table cell = L.create_table();
+                        cell["meanDelta"]   = v.cells[k].meanDelta;
+                        cell["stdDevDelta"] = v.cells[k].stdDevDelta;
+                        cell["sampleCount"] = v.cells[k].sampleCount;
+                        cellsTbl[k + 1] = cell;
+                    }
+                    vrow["cells"] = cellsTbl;
+                    sol::table cvTbl = L.create_table();
+                    for (int k = 0; k < v.contributingVoices.size(); ++k)
+                        cvTbl[k + 1] = v.contributingVoices[k] + 1;   // 1-based
+                    vrow["contributingVoices"] = cvTbl;
+                    vsTbl[vi + 1] = vrow;
+                }
+                row["verdicts"] = vsTbl;
+                clustersTbl[ci + 1] = row;
+            }
+            out["clusters"] = clustersTbl;
+            return out;
+        });
 }
 
 } // namespace lua

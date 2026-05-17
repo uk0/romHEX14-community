@@ -187,6 +187,10 @@ set(SOURCES
     src/io/winols/SimilarityIndex.cpp
     src/io/winols/SimilarFilesDlg.cpp
     src/io/winols/BuildIndexProgressDlg.cpp
+    src/io/legion/Legion.cpp
+    src/io/legion/LegionDlg.cpp
+    src/io/legion/LegionPreviewWidget.cpp
+    src/io/legion/LegionHarvestWorker.cpp
     src/cloud/CloudClient.cpp
     src/cloud/CloudToolsDlg.cpp
     src/datalog/LogTable.cpp

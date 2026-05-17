@@ -470,3 +470,14 @@ void WaveformEditor::emitModified(int start, int end)
 {
     emit dataModified(start, end);
 }
+
+void WaveformEditor::submitExternal(int offset,
+                                    const QByteArray &before,
+                                    const QByteArray &after)
+{
+    if (!m_data || before.size() != after.size() || before.isEmpty()) return;
+    if (offset < 0 || offset + after.size() > m_data->size())          return;
+    if (before == after)                                               return;
+    pushUndo(offset, before, after);
+    emitModified(offset, offset + after.size());
+}
