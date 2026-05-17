@@ -156,6 +156,7 @@ QJsonObject DebugRpc::dispatch(const QJsonObject &request)
     else if (cmd == "undo")         resp = cmdUndo(args);
     else if (cmd == "remove_anno")  resp = cmdRemoveAnno(args);
     else if (cmd == "dump_ols_rom") resp = cmdDumpOlsRom(args);
+    else if (cmd == "lua_run")      resp = cmdRunLua(args);
     else {
         resp.insert("ok", false);
         resp.insert("error", QStringLiteral("unknown cmd: %1").arg(cmd));
@@ -601,6 +602,23 @@ QJsonObject DebugRpc::cmdDumpOlsRom(const QJsonObject &args)
     r.insert("ok", true);
     r.insert("result", result);
     return r;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Sprint L §5.0.5 / Iter 1 — lua_run RPC handler
+// ─────────────────────────────────────────────────────────────────────────────
+#include "lua/LuaEngine.h"
+
+QJsonObject DebugRpc::cmdRunLua(const QJsonObject &args)
+{
+    QJsonObject r;
+    QString file = args.value(QStringLiteral("file")).toString();
+    if (file.isEmpty()) {
+        r.insert("ok", false);
+        r.insert("error", QStringLiteral("missing 'file' argument"));
+        return r;
+    }
+    return lua::LuaEngine::instance().runFile(file);
 }
 
 #endif // RX14_DEBUG_RPC

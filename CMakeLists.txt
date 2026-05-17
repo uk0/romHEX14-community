@@ -58,6 +58,51 @@ target_compile_definitions(blake3 PRIVATE
     BLAKE3_USE_NEON=0
 )
 
+# ── Lua 5.4 (vendored — see third_party/lua-5.4/) ──────────────────────────
+# Sprint L spec §4. Core sources only (no lua.c REPL, no luac.c compiler).
+set(LUA_CORE_SOURCES
+    third_party/lua-5.4/src/lapi.c
+    third_party/lua-5.4/src/lauxlib.c
+    third_party/lua-5.4/src/lbaselib.c
+    third_party/lua-5.4/src/lcode.c
+    third_party/lua-5.4/src/lcorolib.c
+    third_party/lua-5.4/src/lctype.c
+    third_party/lua-5.4/src/ldblib.c
+    third_party/lua-5.4/src/ldebug.c
+    third_party/lua-5.4/src/ldo.c
+    third_party/lua-5.4/src/ldump.c
+    third_party/lua-5.4/src/lfunc.c
+    third_party/lua-5.4/src/lgc.c
+    third_party/lua-5.4/src/linit.c
+    third_party/lua-5.4/src/liolib.c
+    third_party/lua-5.4/src/llex.c
+    third_party/lua-5.4/src/lmathlib.c
+    third_party/lua-5.4/src/lmem.c
+    third_party/lua-5.4/src/loadlib.c
+    third_party/lua-5.4/src/lobject.c
+    third_party/lua-5.4/src/lopcodes.c
+    third_party/lua-5.4/src/loslib.c
+    third_party/lua-5.4/src/lparser.c
+    third_party/lua-5.4/src/lstate.c
+    third_party/lua-5.4/src/lstring.c
+    third_party/lua-5.4/src/lstrlib.c
+    third_party/lua-5.4/src/ltable.c
+    third_party/lua-5.4/src/ltablib.c
+    third_party/lua-5.4/src/ltm.c
+    third_party/lua-5.4/src/lundump.c
+    third_party/lua-5.4/src/lutf8lib.c
+    third_party/lua-5.4/src/lvm.c
+    third_party/lua-5.4/src/lzio.c
+)
+add_library(lua_static STATIC ${LUA_CORE_SOURCES})
+set_target_properties(lua_static PROPERTIES
+    AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
+target_include_directories(lua_static SYSTEM PUBLIC third_party/lua-5.4/src)
+if(WIN32)
+    target_compile_definitions(lua_static PUBLIC LUA_USE_WINDOWS)
+endif()
+target_compile_options(lua_static PRIVATE -w)  # silence Lua's own warnings
+
 set(SOURCES
     src/main.cpp
     src/mainwindow.cpp
@@ -156,6 +201,12 @@ set(SOURCES
     src/datalog/ChannelTreeWidget.cpp
     src/datalog/LogViewerWindow.cpp
     src/datalog/CompareLogsDialog.cpp
+    src/lua/LuaEngine.cpp
+    src/lua/LuaConstants.cpp
+    src/lua/LuaApi_Global.cpp
+    src/lua/LuaApi_Http.cpp
+    src/lua/LuaApi_Project.cpp
+    src/lua/LuaApi_Stubs.cpp
     src/debug/DebugLog.cpp
 )
 
@@ -260,6 +311,8 @@ set(HEADERS
     src/datalog/ChannelTreeWidget.h
     src/datalog/LogViewerWindow.h
     src/datalog/CompareLogsDialog.h
+    src/lua/LuaEngine.h
+    src/lua/LuaPropertyIds.h
     src/debug/DebugLog.h
 )
 
@@ -342,8 +395,15 @@ target_include_directories(rx14 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/stubs" "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
+# Sprint L §4 — sol2 (header-only) include path, marked SYSTEM to
+# silence sol2's own template-instantiation warnings.
+target_include_directories(rx14 SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sol2"
+)
+
 target_link_libraries(rx14 PRIVATE
     blake3
+    lua_static       # Sprint L §4 — embedded Lua 5.4
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets

@@ -13,6 +13,8 @@
 #include <QString>
 #include <QVector>
 #include <QSet>
+#include <QHash>
+#include <QVariant>
 #include <cstdint>
 
 // Shared ROM data model
@@ -170,10 +172,45 @@ struct MapInfo {
     uint32_t cellDataType = 0;
     bool     cellBigEndian = false;  // true for BE variants of cellDataType
 
+    // Storage for WinOLS Lua map properties that have no direct MapInfo field.
+    // Used by windowSetMapProperties / windowGetMapProperties for the
+    // "accepted no-op" property bag (Spalten with no axis, StuetzX.bRueckwaerts,
+    // etc).  Sprint L spec §5.0.2.  Not persisted to .rx14proj — purely a
+    // per-session compatibility shim so WinOLS scripts that touch many
+    // properties don't fail with "unknown property".
+    QHash<QString, QVariant> sideProps;
+
+    QVariant getSideProp(const QString &name) const {
+        return sideProps.value(name);
+    }
+    void setSideProp(const QString &name, const QVariant &v) {
+        sideProps.insert(name, v);
+    }
+
     bool operator==(const MapInfo &o) const {
         return name == o.name && address == o.address;
     }
 };
+
+// WinOLS map-type enum ↔ romHEX14 string-typed MapInfo::type bridge.
+// WinOLS uses integer enum (eEindim=curve, eZweidim=map, eAchse=axis);
+// our MapInfo::type is a string ("MAP"/"CURVE"/"VAL_BLK"/"AXIS"/"VALUE").
+// These free functions translate between them — Sprint L spec §5.0.3.
+inline QString mapTypeFromWinOlsEnum(int e) {
+    switch (e) {
+    case 1: return QStringLiteral("CURVE");   // eEindim
+    case 2: return QStringLiteral("MAP");     // eZweidim
+    case 3: return QStringLiteral("AXIS");    // eAchse
+    default: return QStringLiteral("VALUE");
+    }
+}
+
+inline int mapTypeToWinOlsEnum(const QString &t) {
+    if (t == QStringLiteral("CURVE"))   return 1;
+    if (t == QStringLiteral("MAP"))     return 2;
+    if (t == QStringLiteral("AXIS"))    return 3;
+    return 0;
+}
 
 struct MapRegion {
     uint32_t start = 0;

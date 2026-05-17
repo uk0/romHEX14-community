@@ -211,3 +211,130 @@ ParsedROM parseROMFile(const QString &filePath)
     }
     return parseROMData(f.readAll());
 }
+
+// ── Writers (Iter 9) ──────────────────────────────────────────────────────
+
+static inline void appendHex2(QByteArray &out, uint8_t v)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    out.append(digits[(v >> 4) & 0xF]);
+    out.append(digits[v & 0xF]);
+}
+
+QByteArray writeIntelHex(const QByteArray &buf, uint32_t baseAddress,
+                         int bytesPerRecord)
+{
+    if (bytesPerRecord <= 0 || bytesPerRecord > 255) bytesPerRecord = 16;
+    QByteArray out;
+    out.reserve(buf.size() * 3);   // rough preallocate
+
+    uint32_t upper16 = 0xFFFFFFFFu;   // sentinel — force initial Type 04
+    qint64 i = 0;
+    while (i < buf.size()) {
+        uint32_t physAddr = baseAddress + uint32_t(i);
+        uint32_t curUpper = physAddr >> 16;
+        uint16_t addr16   = uint16_t(physAddr & 0xFFFF);
+
+        // Emit Type 04 (extended linear address) when the upper 16 bits change.
+        if (curUpper != upper16) {
+            uint8_t cs = 2 + 0 + 0 + 4 + uint8_t(curUpper >> 8) + uint8_t(curUpper & 0xFF);
+            cs = uint8_t(-int8_t(cs));
+            out.append(':');
+            appendHex2(out, 2); appendHex2(out, 0); appendHex2(out, 0);
+            appendHex2(out, 4);
+            appendHex2(out, uint8_t(curUpper >> 8));
+            appendHex2(out, uint8_t(curUpper & 0xFF));
+            appendHex2(out, cs);
+            out.append("\r\n");
+            upper16 = curUpper;
+        }
+
+        // How many bytes fit in this record before crossing a 64K boundary?
+        int chunk = bytesPerRecord;
+        if (i + chunk > buf.size()) chunk = int(buf.size() - i);
+        if (int(addr16) + chunk > 0x10000) chunk = 0x10000 - int(addr16);
+
+        // Data record (type 00)
+        uint8_t cs = uint8_t(chunk) + uint8_t(addr16 >> 8) + uint8_t(addr16 & 0xFF) + 0;
+        out.append(':');
+        appendHex2(out, uint8_t(chunk));
+        appendHex2(out, uint8_t(addr16 >> 8));
+        appendHex2(out, uint8_t(addr16 & 0xFF));
+        appendHex2(out, 0);
+        for (int k = 0; k < chunk; ++k) {
+            uint8_t b = uint8_t(buf.at(int(i) + k));
+            appendHex2(out, b);
+            cs += b;
+        }
+        cs = uint8_t(-int8_t(cs));
+        appendHex2(out, cs);
+        out.append("\r\n");
+
+        i += chunk;
+    }
+
+    // EOF record (type 01)
+    out.append(":00000001FF\r\n");
+    return out;
+}
+
+QByteArray writeSRecord(const QByteArray &buf, uint32_t baseAddress,
+                        int bytesPerRecord)
+{
+    if (bytesPerRecord <= 0 || bytesPerRecord > 250) bytesPerRecord = 16;
+    QByteArray out;
+    out.reserve(buf.size() * 3);
+
+    // Pick S1 (16-bit addr) / S2 (24-bit) / S3 (32-bit) based on the span.
+    uint64_t endAddr = uint64_t(baseAddress) + uint64_t(buf.size()) - 1;
+    char dataType = (endAddr <= 0xFFFFu)   ? '1'
+                  : (endAddr <= 0xFFFFFFu) ? '2'
+                                           : '3';
+    char endType  = (dataType == '1') ? '9' : (dataType == '2') ? '8' : '7';
+    int  addrBytes = (dataType == '1') ? 2 : (dataType == '2') ? 3 : 4;
+
+    // S0 header (optional, blank payload).
+    out.append("S00600006861736800\r\n");   // "hash\0" header — purely cosmetic
+
+    qint64 i = 0;
+    while (i < buf.size()) {
+        uint32_t physAddr = baseAddress + uint32_t(i);
+        int chunk = bytesPerRecord;
+        if (i + chunk > buf.size()) chunk = int(buf.size() - i);
+
+        int byteCount = addrBytes + chunk + 1;   // addr + data + checksum
+        uint8_t cs = uint8_t(byteCount);
+        out.append('S').append(dataType);
+        appendHex2(out, uint8_t(byteCount));
+        // Address (big-endian, addrBytes wide).
+        for (int b = addrBytes - 1; b >= 0; --b) {
+            uint8_t v = uint8_t((physAddr >> (b * 8)) & 0xFF);
+            appendHex2(out, v);
+            cs += v;
+        }
+        for (int k = 0; k < chunk; ++k) {
+            uint8_t b = uint8_t(buf.at(int(i) + k));
+            appendHex2(out, b);
+            cs += b;
+        }
+        cs = uint8_t(~cs);
+        appendHex2(out, cs);
+        out.append("\r\n");
+        i += chunk;
+    }
+
+    // End record (S7/S8/S9) — execution start = baseAddress (cosmetic).
+    int byteCount = addrBytes + 1;
+    uint8_t cs = uint8_t(byteCount);
+    out.append('S').append(endType);
+    appendHex2(out, uint8_t(byteCount));
+    for (int b = addrBytes - 1; b >= 0; --b) {
+        uint8_t v = uint8_t((baseAddress >> (b * 8)) & 0xFF);
+        appendHex2(out, v);
+        cs += v;
+    }
+    cs = uint8_t(~cs);
+    appendHex2(out, cs);
+    out.append("\r\n");
+    return out;
+}

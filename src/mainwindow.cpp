@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "appconstants.h"
+#include "lua/LuaEngine.h"
 #include "hexcomparedlg.h"
 #include "diffpanel.h"
 #include "savepoints/SavepointManager.h"
@@ -363,6 +364,10 @@ MainWindow::MainWindow(QWidget *parent)
     m_mdi->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     m_mdi->setBackground(QBrush(QColor(0x08, 0x0b, 0x10)));
     m_mainSplitter->addWidget(m_mdi);
+
+    // Sprint L Iter 1 — initialize embedded Lua engine.
+    // Safe to call here: MDI exists, MainWindow itself is `this`.
+    lua::LuaEngine::instance().initialize(this);
 
     // ── AI Assistant right panel ──────────────────────────────────────
     m_aiAssistant = new AIAssistant(this);
@@ -7433,7 +7438,12 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *ev)
     // Modified project → ask the user before letting Qt close the window.
     // The save / discard / cancel dialog is synchronous; everything below
     // deferred to a singleShot.
-    if (proj->modified) {
+    //
+    // Iter 8.2 v2: under RX14_LUA_TEST=1 (the headless RPC test harness)
+    // we MUST NOT show modals — they block the Qt event loop forever
+    // because nobody is on the keyboard.  Treat modified as "discard" so
+    // close proceeds non-interactively.
+    if (proj->modified && qgetenv("RX14_LUA_TEST") != "1") {
         QMessageBox mb(this);
         mb.setWindowTitle(tr("Close Project"));
         mb.setText(QString("<b>%1</b>").arg(proj->fullTitle()));
@@ -8991,10 +9001,76 @@ void MainWindow::runBulkEdit(const QVector<MapInfo> &maps)
         tr("Bulk edit applied to %1 maps").arg(maps.size()), 6000);
 }
 
+// ── Sprint L Lua bridge ─────────────────────────────────────────────────────
+Project *MainWindow::luaActiveProject() const
+{
+    return activeProject();   // delegate to existing private impl
+}
+
+void MainWindow::luaNewProject()
+{
+    // Headless equivalent of "File → New Project": create a Project,
+    // add it to MainWindow's project list, and open a sub-window for it.
+    // Lua's projectImport(file) then operates on this freshly created project.
+    auto *p = new Project(this);
+    p->name = QStringLiteral("LuaNewProject");
+    p->createdAt = QDateTime::currentDateTime();
+    p->changedAt = p->createdAt;
+    if (m_mdi) openProject(p);
+}
+
+int MainWindow::luaSaveAllProjects()
+{
+    int saved = 0;
+    for (Project *p : m_projects) {
+        if (!p) continue;
+        if (p->filePath.isEmpty()) continue;   // skip in-memory projects
+        if (p->save()) ++saved;
+    }
+    return saved;
+}
+
+int MainWindow::luaCloseAllProjects()
+{
+    if (!m_mdi) return 0;
+    int count = m_mdi->subWindowList().size();
+    m_mdi->closeAllSubWindows();
+    return count;
+}
+
+bool MainWindow::luaCloseActiveProject(bool deleteFile)
+{
+    // Thin wrapper — does NOT touch m_projects directly.  Setting
+    // modified=false skips the "save?" modal in eventFilter(); sw->close()
+    // then triggers eventFilter which schedules finalizeClosedProject() via
+    // QTimer::singleShot(0).  All m_projects/recentMaps/overlays mutation
+    // happens deferred, after MDI's post-close relayout pass — see comment
+    // on finalizeClosedProject() for the race history.
+    if (!m_mdi) return false;
+    auto *sw = m_mdi->activeSubWindow();
+    if (!sw) return false;
+    auto *pv = qobject_cast<ProjectView *>(sw->widget());
+    if (!pv) return false;
+    auto *proj = pv->project();
+    if (!proj) return false;
+
+    const QString path = proj->filePath;
+    proj->modified = false;
+    sw->close();
+
+    if (deleteFile && !path.isEmpty()) {
+        QTimer::singleShot(0, this, [path]{
+            if (QFile::exists(path)) QFile::remove(path);
+        });
+    }
+    return true;
+}
+
 // ── Datalog menu wiring ─────────────────────────────────────────────────────
 
 #include "datalog/LogViewerWindow.h"
 #include "datalog/CompareLogsDialog.h"
+#include "lua/LuaEngine.h"
 
 QStringList MainWindow::datalogRecent() const
 {
@@ -9049,6 +9125,26 @@ void MainWindow::rebuildDatalogMenu()
 
     auto *cmpAct = m_menuDatalog->addAction(tr("&Compare Logs…"));
     connect(cmpAct, &QAction::triggered, this, &MainWindow::compareDatalogs);
+
+    // Sprint L — run an external Lua script through the embedded engine.
+    m_menuDatalog->addSeparator();
+    auto *luaAct = m_menuDatalog->addAction(tr("Run &Lua Script…"));
+    connect(luaAct, &QAction::triggered, this, [this]() {
+        QString path = QFileDialog::getOpenFileName(this,
+            tr("Run Lua Script"), QString(),
+            tr("Lua scripts (*.lua);;All files (*)"));
+        if (path.isEmpty()) return;
+        QJsonObject r = lua::LuaEngine::instance().runFile(path);
+        if (!r.value(QStringLiteral("ok")).toBool()) {
+            QMessageBox::warning(this, tr("Lua error"),
+                                 r.value(QStringLiteral("error")).toString());
+        } else {
+            QString out = r.value(QStringLiteral("output")).toString();
+            if (!out.isEmpty()) {
+                QMessageBox::information(this, tr("Lua output"), out);
+            }
+        }
+    });
 
     QStringList list = datalogRecent();
     if (!list.isEmpty()) {
