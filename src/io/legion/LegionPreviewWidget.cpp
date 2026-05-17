@@ -3,7 +3,7 @@
  * Copyright (C) 2026 Cristian Tabuyo <contact@romhex14.com>
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * LegionPreviewWidget — per-verdict preview pane (LEGION.6).
+ * LegionPreviewWidget — per-suggestion preview pane (heatmap + sources).
  */
 
 #include "io/legion/LegionPreviewWidget.h"
@@ -12,6 +12,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QObject>
 #include <QPainter>
 #include <QPen>
 #include <QTreeWidget>
@@ -25,29 +26,29 @@ namespace legion {
 
 namespace {
 
-const char *tagName(VerdictTag t)
+QString tagName(VerdictTag t)
 {
     switch (t) {
-    case VerdictTag::Unanimous:       return "UNANIMOUS";
-    case VerdictTag::StrongConsensus: return "STRONG";
-    case VerdictTag::Majority:        return "MAJORITY";
-    case VerdictTag::Contested:       return "CONTESTED";
-    case VerdictTag::Heretic:         return "HERETIC";
-    case VerdictTag::Checksum:        return "CHECKSUM";
-    case VerdictTag::KillRegion:      return "KILL";
+    case VerdictTag::Unanimous:       return QObject::tr("All agree");
+    case VerdictTag::StrongConsensus: return QObject::tr("Strong");
+    case VerdictTag::Majority:        return QObject::tr("Majority");
+    case VerdictTag::Contested:       return QObject::tr("Disputed");
+    case VerdictTag::Heretic:         return QObject::tr("Outlier");
+    case VerdictTag::Checksum:        return QObject::tr("Checksum");
+    case VerdictTag::KillRegion:      return QObject::tr("Erase");
     }
-    return "?";
+    return QStringLiteral("?");
 }
 
-const char *kindName(VerdictKind k)
+QString kindName(VerdictKind k)
 {
     switch (k) {
-    case VerdictKind::Scalar:   return "scalar";
-    case VerdictKind::Curve:    return "curve";
-    case VerdictKind::SmallMap: return "small-map";
-    case VerdictKind::LargeMap: return "large-map";
+    case VerdictKind::Scalar:   return QObject::tr("Scalar");
+    case VerdictKind::Curve:    return QObject::tr("Curve");
+    case VerdictKind::SmallMap: return QObject::tr("Map");
+    case VerdictKind::LargeMap: return QObject::tr("Large map");
     }
-    return "?";
+    return QStringLiteral("?");
 }
 
 // Colorize a delta value relative to its absolute peak:
@@ -72,7 +73,6 @@ LegionPreviewCanvas::LegionPreviewCanvas(QWidget *parent)
     : QFrame(parent)
 {
     setFrameShape(QFrame::StyledPanel);
-    setStyleSheet("QFrame { background:#0d1117; border:1px solid #30363d; }");
     setMinimumHeight(160);
 }
 
@@ -223,40 +223,30 @@ void LegionPreviewCanvas::paintMap(QPainter &p)
 LegionPreviewWidget::LegionPreviewWidget(QWidget *parent)
     : QWidget(parent)
 {
-    setStyleSheet(
-        "QWidget { background:#161b22; color:#c9d1d9; }"
-        "QLabel#title { color:#e6edf3; font-size:11pt; font-weight:600;"
-        "  font-family:Consolas,monospace; }"
-        "QLabel#meta  { color:#8b949e; font-size:9pt; }"
-        "QTreeWidget { background:#0d1117; color:#e6edf3;"
-        "  alternate-background-color:#111820; border:1px solid #30363d; }"
-        "QHeaderView::section { background:#161b22; color:#8b949e;"
-        "  border:none; border-right:1px solid #30363d;"
-        "  border-bottom:1px solid #30363d; padding:3px 6px; }");
-
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(8, 8, 8, 8);
     root->setSpacing(6);
 
-    m_lblTitle = new QLabel(tr("(pick a verdict)"));
-    m_lblTitle->setObjectName("title");
+    m_lblTitle = new QLabel(tr("(select a suggestion)"));
+    QFont titleFont = m_lblTitle->font();
+    titleFont.setBold(true);
+    m_lblTitle->setFont(titleFont);
     root->addWidget(m_lblTitle);
 
     m_lblMeta = new QLabel();
-    m_lblMeta->setObjectName("meta");
     m_lblMeta->setWordWrap(true);
     root->addWidget(m_lblMeta);
 
     m_canvas = new LegionPreviewCanvas();
     root->addWidget(m_canvas, 1);
 
-    auto *voicesLabel = new QLabel(tr("Voices"));
-    voicesLabel->setObjectName("meta");
+    auto *voicesLabel = new QLabel(tr("Contributing files"));
     root->addWidget(voicesLabel);
 
     m_treeVoices = new QTreeWidget();
     m_treeVoices->setColumnCount(3);
-    m_treeVoices->setHeaderLabels({tr("Source"), tr("Sim%"), tr("Δ at densest")});
+    m_treeVoices->setHeaderLabels({tr("Source"), tr("Match %"),
+                                   tr("Δ at densest cell")});
     m_treeVoices->setRootIsDecorated(false);
     m_treeVoices->setAlternatingRowColors(true);
     m_treeVoices->header()->setStretchLastSection(true);
@@ -276,19 +266,19 @@ void LegionPreviewWidget::showVerdict(const LegionVerdict *v)
     m_verdict = v;
     m_canvas->setVerdict(v);
     if (!v) {
-        m_lblTitle->setText(tr("(pick a verdict)"));
+        m_lblTitle->setText(tr("(select a suggestion)"));
         m_lblMeta->clear();
         m_treeVoices->clear();
         return;
     }
-    m_lblTitle->setText(QStringLiteral("[%1]  0x%2..0x%3   %4 %5×%6")
-        .arg(QString::fromLatin1(tagName(v->tag)))
+    m_lblTitle->setText(tr("[%1]  0x%2..0x%3   %4 %5×%6")
+        .arg(tagName(v->tag))
         .arg(v->startAddr, 0, 16)
         .arg(v->endAddr,   0, 16)
-        .arg(QString::fromLatin1(kindName(v->kind)))
+        .arg(kindName(v->kind))
         .arg(v->rows).arg(v->cols));
-    m_lblMeta->setText(tr("cellSize=%1 · cells=%2 · maxSample=%3 · "
-                          "consensusStrength=%4")
+    m_lblMeta->setText(tr("Cell size: %1 B · Cells: %2 · "
+                          "Max samples: %3 · Consensus: %4")
         .arg(v->cellSize).arg(v->cells.size())
         .arg(v->maxSampleCount)
         .arg(v->consensusStrength, 0, 'f', 3));

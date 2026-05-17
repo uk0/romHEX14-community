@@ -82,7 +82,7 @@ sol::object jsonValueToSol(sol::state_view L, const QJsonValue &v)
     case QJsonValue::Null:
     case QJsonValue::Undefined:
     default:
-        return sol::nil;
+        return sol::lua_nil;
     }
 }
 
@@ -126,7 +126,7 @@ QJsonValue solObjectToJson(const sol::object &v)
         }
         return obj;
     }
-    case sol::type::nil:
+    case sol::type::lua_nil:
     default:
         return QJsonValue::Null;
     }
@@ -251,7 +251,7 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
         else if (iconBits == 0x20) icon = QMessageBox::Question;       // MB_ICONQUESTION
         else if (iconBits == 0x30) icon = QMessageBox::Warning;        // MB_ICONWARNING
         else if (iconBits == 0x40) icon = QMessageBox::Information;    // MB_ICONINFORMATION
-        QMessageBox box(icon, QStringLiteral("Lua"), q);
+        QMessageBox box(icon, QObject::tr("Lua script"), q);
         // Button set (low nibble)
         switch (t & 0xF) {
         case 1: box.setStandardButtons(QMessageBox::Ok | QMessageBox::Cancel); break;
@@ -290,10 +290,10 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
     L.set_function("fromJSON", [&L](const std::string &s) -> sol::object {
         QJsonParseError err;
         QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(s), &err);
-        if (err.error != QJsonParseError::NoError) return sol::nil;
+        if (err.error != QJsonParseError::NoError) return sol::lua_nil;
         if (doc.isArray())  return jsonValueToSol(L, QJsonValue(doc.array()));
         if (doc.isObject()) return jsonValueToSol(L, QJsonValue(doc.object()));
-        return sol::nil;
+        return sol::lua_nil;
     });
     L.set_function("toJSON", [](sol::object t) -> std::string {
         QJsonValue v = solObjectToJson(t);
