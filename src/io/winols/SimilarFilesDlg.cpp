@@ -10,6 +10,7 @@
 #include "io/winols/WinOlsConfig.h"
 #include "io/winols/WinOlsCatalogReader.h"
 #include "io/winols/RomFingerprint.h"
+#include "io/ols/OlsImporter.h"
 
 #include "debug/DebugLog.h"
 
@@ -405,9 +406,9 @@ void SimilarFilesDlg::buildUi()
     root->addLayout(minRow);
 
     m_tree = new QTreeWidget();
-    m_tree->setColumnCount(7);
+    m_tree->setColumnCount(8);
     m_tree->setHeaderLabels({
-        tr("% Match"), tr("Source"),
+        tr("% Match"), tr("Byte%"), tr("Source"),
         tr("Make"), tr("Model"), tr("ECU"), tr("SW"), tr("File")});
     m_tree->setRootIsDecorated(false);
     m_tree->setAlternatingRowColors(true);
@@ -574,17 +575,23 @@ void SimilarFilesDlg::populateTable(const QVector<SimilarityMatch> &matches)
     for (const auto &m : matches) {
         auto *it = new QTreeWidgetItem({
             QString("%1%").arg(m.score.wholePct(), 3),
+            QStringLiteral("…"),                      // byte-match placeholder
             tr("(file)"),
             QString(), QString(), QString(), QString(),
             QFileInfo(m.path).fileName()
         });
         it->setData(0, Qt::UserRole, m.path);
         it->setData(0, Qt::UserRole + 1, double(m.score.wholeFile));
-        it->setToolTip(6, m.path);
+        it->setToolTip(7, m.path);
         m_tree->addTopLevelItem(it);
     }
     m_tree->setSortingEnabled(true);
     m_tree->sortByColumn(0, Qt::DescendingOrder);
+
+    // Kick off the byte-match scoring on a worker thread for the top
+    // N rows by MinHash score.  This is the only honest way to tell
+    // a real byte-twin from an n-gram lookalike.
+    scheduleByteMatchScan(matches);
 }
 
 namespace {
@@ -794,6 +801,147 @@ void SimilarFilesDlg::onRebuildIndex()
     dlg.exec();
     qCInfo(catFind) << "rebuild dialog closed; running query";
     runQuery();
+}
+
+// ── byte-match scan ────────────────────────────────────────────────────
+//
+// The MinHash fingerprint in the index measures n-gram overlap — two ROMs
+// can share 98% of their n-grams while only ~60% of their bytes line up.
+// To let the user pick a real byte-twin (not just a code-pattern lookalike)
+// we run a real byte-by-byte comparison against the user's source ROM for
+// the top-N matches and surface the result in a second percentage column.
+
+void SimilarFilesDlg::scheduleByteMatchScan(const QVector<SimilarityMatch> &matches)
+{
+    static constexpr int kTopN = 30;
+    if (m_romBytes.isEmpty()) return;
+    const QByteArray needle = m_romBytes;
+    const int n = qMin(kTopN, matches.size());
+
+    for (int i = 0; i < n; ++i) {
+        const QString path = matches[i].path;
+        if (path.isEmpty()) continue;
+        if (m_byteMatchCache.contains(path)) {
+            onByteMatchResult(path, m_byteMatchCache.value(path));
+            continue;
+        }
+        QPointer<SimilarFilesDlg> self = this;
+        QtConcurrent::run([self, path, needle]() {
+            QFile f(path);
+            if (!f.open(QIODevice::ReadOnly)) return;
+            const QByteArray raw = f.readAll();
+            f.close();
+            if (raw.isEmpty()) return;
+
+            // Gather every plausible byte stream the file might contain:
+            //   - raw file (covers .bin / .ori / unknown formats)
+            //   - every Version_N.romData from OlsImporter (covers .ols/.kp)
+            // Then score each one and keep the maximum.  This handles the
+            // common case where the user's ROM corresponds to a later
+            // tuned version of a multi-version .ols rather than v0.
+            QVector<QByteArray> candidates;
+            candidates.append(raw);
+            try {
+                ols::OlsImportResult r = ols::OlsImporter::importFromBytes(raw);
+                if (r.error.isEmpty()) {
+                    for (const auto &v : r.versions) {
+                        if (!v.romData.isEmpty()) candidates.append(v.romData);
+                    }
+                }
+            } catch (...) {}
+
+            // ── Byte-match with offset search ──────────────────────────
+            //
+            // Common case: needle is a bench-full dump (5-8 MB, multiple
+            // flash regions concatenated), candidate is one calibration
+            // partition (~2 MB).  Comparing at offset 0 just lines up
+            // bootloader-vs-calibration → ~10% incidental match.
+            //
+            // To find the real alignment we slide the candidate over the
+            // needle at 64 KB granularity, computing a *sampled* score
+            // (every 256th byte) on each step.  Top-3 candidate offsets
+            // then get re-scored at full byte resolution; whichever
+            // wins is taken as the file's true byte-match.
+            const auto *pa = reinterpret_cast<const uint8_t *>(needle.constData());
+            const int nN = needle.size();
+
+            auto scoreAt = [&](const QByteArray &cand, int off, int step) {
+                const int sz = cand.size();
+                if (off < 0 || off + sz > nN) return std::make_pair(0, 0);
+                const auto *pb = reinterpret_cast<const uint8_t *>(cand.constData());
+                int n = 0, m = 0;
+                for (int i = 0; i < sz; i += step) {
+                    if (pa[off + i] == pb[i]) ++m;
+                    ++n;
+                }
+                return std::make_pair(m, n);
+            };
+
+            int bestMatch = 0, bestN = 0;
+            for (const QByteArray &cand : candidates) {
+                if (cand.isEmpty()) continue;
+                const int sz = cand.size();
+                if (sz > nN) {
+                    // Candidate bigger than needle — just byte-compare on
+                    // the smaller window (rare case).
+                    auto [m, n] = scoreAt(cand, 0, 1);
+                    if (n > 0 && m * bestN > bestMatch * n) { bestMatch = m; bestN = n; }
+                    else if (bestN == 0)                    { bestMatch = m; bestN = n; }
+                    continue;
+                }
+
+                // Stage 1 — coarse sample-scan at 64 KB steps.
+                const int kStride = 64 * 1024;
+                struct Cand { int off, m, n; };
+                QVector<Cand> tops;
+                for (int off = 0; off + sz <= nN; off += kStride) {
+                    auto [m, n] = scoreAt(cand, off, 256);
+                    tops.append({off, m, n});
+                }
+                if (tops.isEmpty()) {
+                    auto [m, n] = scoreAt(cand, 0, 1);
+                    if (n > 0 && m * bestN > bestMatch * n) { bestMatch = m; bestN = n; }
+                    else if (bestN == 0)                    { bestMatch = m; bestN = n; }
+                    continue;
+                }
+                // Stage 2 — keep the 3 best offsets, rescore at full res.
+                std::partial_sort(tops.begin(),
+                    tops.begin() + qMin(3, tops.size()), tops.end(),
+                    [](const Cand &a, const Cand &b) {
+                        return double(a.m) / qMax(1, a.n)
+                             > double(b.m) / qMax(1, b.n);
+                    });
+                const int K = qMin(3, tops.size());
+                for (int t = 0; t < K; ++t) {
+                    auto [m, n] = scoreAt(cand, tops[t].off, 1);
+                    if (n > 0 && m * bestN > bestMatch * n) { bestMatch = m; bestN = n; }
+                    else if (bestN == 0)                    { bestMatch = m; bestN = n; }
+                }
+            }
+            if (bestN <= 0) return;
+            const double pct = double(bestMatch) * 100.0 / double(bestN);
+            QMetaObject::invokeMethod(self.data(), [self, path, pct]() {
+                if (self) self->onByteMatchResult(path, pct);
+            }, Qt::QueuedConnection);
+        });
+    }
+}
+
+void SimilarFilesDlg::onByteMatchResult(const QString &path, double pct)
+{
+    m_byteMatchCache.insert(path, pct);
+    if (!m_tree) return;
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        auto *it = m_tree->topLevelItem(i);
+        if (it->data(0, Qt::UserRole).toString() != path) continue;
+        it->setText(1, QStringLiteral("%1%").arg(pct, 0, 'f', 1));
+        QColor c;
+        if      (pct >= 95.0) c = QColor("#3fb950");  // green
+        else if (pct >= 70.0) c = QColor("#d29922");  // amber
+        else                  c = QColor("#f85149");  // red
+        it->setForeground(1, c);
+        break;
+    }
 }
 
 }  // namespace winols

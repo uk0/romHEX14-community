@@ -61,6 +61,9 @@ private slots:
     void onRowActivated(QTreeWidgetItem *it, int col);
     void onRebuildIndex();
 
+private slots:
+    void onByteMatchResult(const QString &path, double pct);
+
 private:
     void buildUi();
     void runQuery();
@@ -68,6 +71,7 @@ private:
     void populateTable(const QVector<SimilarityMatch> &matches);
     void enrichFromCatalog();
     void applyCatalogToRows();
+    void scheduleByteMatchScan(const QVector<SimilarityMatch> &matches);
 
     QString m_sourcePath;
     QByteArray m_romBytes;
@@ -87,6 +91,7 @@ private:
     QPushButton  *m_cmpBtn   = nullptr;
     QPushButton  *m_rebuild  = nullptr;
     std::atomic<bool> m_queryRunning{false};
+    QHash<QString, double> m_byteMatchCache;
 };
 
 }  // namespace winols

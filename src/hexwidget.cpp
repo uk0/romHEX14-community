@@ -530,8 +530,11 @@ void HexWidget::renderRow(QPainter &p, int row, int y)
             p.fillRect(br, bg);
             p.setPen(fg);
         } else if (isDiff) {
-            p.fillRect(br, QColor(60, 35, 10, 160));  // dark amber background
-            p.setPen(QColor(255, 160, 50));            // amber text
+            // Side-by-side compare highlight.  Muted amber so dense-diff
+            // regions don't drown out the rest of the view, but still
+            // distinguishable from the default cell colour.
+            p.fillRect(br, QColor(120,  75,  20, 160));
+            p.setPen(QColor(255, 200, 110));
         } else if (isModified) {
             p.setPen(AppConfig::instance().colors.hexModified);
         } else {
@@ -574,6 +577,14 @@ void HexWidget::renderRow(QPainter &p, int row, int y)
 
             if (m_modifications.contains(idx))
                 fill = AppConfig::instance().colors.hexModified;
+
+            // Compare highlight: byte differs from setComparisonData().
+            // Bright amber so dense-diff regions remain visible even in
+            // the slim bar-mode bands.
+            if ((int)idx < m_comparisonData.size()
+                && m_data[idx] != m_comparisonData[idx]) {
+                fill = QColor(255, 145, 35, 220);
+            }
 
             // Selection highlight in bar mode
             if (hasSel && (int)idx >= sStart && (int)idx <= sEnd)

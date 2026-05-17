@@ -2711,17 +2711,34 @@ void MainWindow::retranslateUi()
             }
             const QByteArray after = p->currentData.mid(int(lo), spanLen);
 
-            // Route through the WaveformEditor so the change lands as ONE
-            // undo entry alongside every other batch op the editor manages.
+            // Each view keeps its OWN byte buffer:
+            //   - Project::currentData (we just wrote into this)
+            //   - WaveformWidget::m_data (waveform-editor backing store)
+            //   - HexWidget::m_data + m_modifications set
+            //
+            // ProjectView's existing WaveformWidget::dataModified handler
+            // copies wave→project on every edit; if we skip resyncing
+            // wave first, that copy would clobber the LEGION writes with
+            // STALE wave bytes.  HexWidget also needs an explicit refresh
+            // so the new diff-vs-original highlights (m_modifications) get
+            // recomputed.
             ProjectView *pv = activeView();
             WaveformWidget *ww = pv ? pv->waveformWidget() : nullptr;
             WaveformEditor *ed = ww ? ww->editor() : nullptr;
+
+            if (ww) ww->showROM(p->currentData, p->originalData);
+            if (pv && pv->hexWidget())
+                pv->hexWidget()->refreshData(p->currentData);
+
+            // Route the undo entry through the editor so Ctrl+Z reverts
+            // the whole LEGION batch in one shot.  emitModified fires
+            // dataModified, but with wave now in sync the ProjectView
+            // handler's memcmp short-circuits — no clobber.
             if (ed) {
                 ed->submitExternal(int(lo), before, after);
-            } else {
-                // No editor → mirror the change to listeners ourselves.
-                emit p->dataChanged();
             }
+            p->modified = true;
+            emit p->dataChanged();
             statusBar()->showMessage(
                 tr("LEGION: %1 verdicts applied (%2 bytes changed). Ctrl+Z to undo.")
                 .arg(verdicts.size()).arg(totalChanged), 6000);
@@ -7097,6 +7114,77 @@ void MainWindow::actFindSimilarFiles()
         qCInfo(catFind) << "openSimilarRequested done; total="
                         << total.elapsed() << "ms";
     });
+
+    // "Open as comparison" — same import flow as Open, then pop the
+    // existing Compare-Hex dialog so the user lands directly in diff view.
+    connect(dlg, &winols::SimilarFilesDlg::compareWithRequested,
+            this, [this](const QString &path) {
+        qCInfo(catFind) << "compareWithRequested path=" << path;
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) {
+            QMessageBox::warning(this, tr("Open as comparison"),
+                tr("Could not read file: %1").arg(f.errorString()));
+            return;
+        }
+        const QByteArray fileData = f.readAll();
+        f.close();
+        if (fileData.isEmpty()) {
+            QMessageBox::warning(this, tr("Open as comparison"),
+                tr("File is empty: %1").arg(path));
+            return;
+        }
+        ols::OlsImportResult result;
+        try { result = ols::OlsImporter::importFromBytes(fileData); }
+        catch (const std::exception &e) {
+            QMessageBox::critical(this, tr("Import error"),
+                tr("OLS import threw: %1").arg(QString::fromUtf8(e.what())));
+            return;
+        } catch (...) {
+            QMessageBox::critical(this, tr("Import error"),
+                tr("OLS import threw an unknown exception"));
+            return;
+        }
+        if (!result.error.isEmpty()) {
+            QMessageBox::critical(this, tr("Import error"), result.error);
+            return;
+        }
+        const auto projects =
+            ols::buildProjectsFromOlsImport(result, path, this);
+        Project *justOpened = nullptr;
+        for (Project *p : projects) {
+            m_projects.append(p);
+            openProject(p);
+            if (!justOpened) justOpened = p;
+        }
+        // Auto-pop HexCompareDlg with the active project on the left and
+        // the newly-opened file on the right.
+        if (justOpened) {
+            // Defer the HexCompareDlg creation until after the MDI cascade
+            // from openProject() above settles.  Showing a top-level dialog
+            // mid-cascade has crashed in QMdiArea::resizeEvent on some
+            // builds (likely a QPointer-into-deleted-subwindow race).
+            QPointer<MainWindow> self = this;
+            QPointer<Project>    rightP = justOpened;
+            QTimer::singleShot(0, this, [self, rightP]() {
+                if (!self || !rightP) return;
+                Project *leftP = nullptr;
+                for (Project *p : self->m_projects)
+                    if (p && p != rightP) { leftP = p; break; }
+                auto *cmp = new HexCompareDlg(
+                    QList<Project *>(self->m_projects.begin(),
+                                     self->m_projects.end()),
+                    leftP, self.data(), rightP.data());
+                cmp->setAttribute(Qt::WA_DeleteOnClose);
+                cmp->show();
+                cmp->raise();
+                cmp->activateWindow();
+            });
+        }
+        statusBar()->showMessage(
+            tr("Opened %1 as comparison.").arg(QFileInfo(path).fileName()),
+            4000);
+    });
+
     dlg->show();
     dlg->raise();
     dlg->activateWindow();
