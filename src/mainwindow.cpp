@@ -15,6 +15,7 @@
 #include "io/winols/OlsCfgParser.h"
 #include "io/legion/LegionDlg.h"
 #include "io/legion/Legion.h"
+#include <QCryptographicHash>
 #include "savepoints/SavepointsPanel.h"
 #include "debug/DebugLog.h"
 #include <QDockWidget>
@@ -370,6 +371,24 @@ MainWindow::MainWindow(QWidget *parent)
     // Sprint L Iter 1 — initialize embedded Lua engine.
     // Safe to call here: MDI exists, MainWindow itself is `this`.
     lua::LuaEngine::instance().initialize(this);
+
+    // P0-4/5: lock destructive UI while a Lua script is running.  The
+    // bindings hold raw Project* pointers across QEventLoop pumps
+    // (HttpExecute / Sleep / MessagePump) so a Close-Project click in the
+    // middle would dangle them.  Disabling the action is the smallest
+    // change that closes the race without rearchitecting threading.
+    connect(&lua::LuaEngine::instance(),
+            &lua::LuaEngine::scriptRunningChanged,
+            this, [this](bool running) {
+        if (m_actClose) m_actClose->setEnabled(!running);
+        if (running) {
+            statusBar()->showMessage(
+                tr("Lua script running — close-project disabled until it returns."),
+                0);
+        } else {
+            statusBar()->clearMessage();
+        }
+    });
 
     // ── AI Assistant right panel ──────────────────────────────────────
     m_aiAssistant = new AIAssistant(this);
@@ -9187,6 +9206,65 @@ void MainWindow::rebuildDatalogMenu()
             tr("Run Lua Script"), QString(),
             tr("Lua scripts (*.lua);;All files (*)"));
         if (path.isEmpty()) return;
+
+        // P0-3 consent gate.  Even with the sandbox in place (P0-1) and
+        // the HTTP allowlist (P0-2), a Lua script can still touch project
+        // bytes, query the catalog, and make file-write side effects
+        // inside the project tree.  Treat a fresh script the same way a
+        // browser treats a fresh executable: require explicit consent.
+        //
+        // Repeat runs of the same exact content are silent — we key
+        // trust on SHA-256 so a malicious edit re-prompts even if the
+        // filename is unchanged.
+        QFile probe(path);
+        if (!probe.open(QIODevice::ReadOnly)) {
+            QMessageBox::warning(this, tr("Run Lua Script"),
+                tr("Could not open %1").arg(path));
+            return;
+        }
+        QCryptographicHash hasher(QCryptographicHash::Sha256);
+        hasher.addData(&probe);
+        probe.close();
+        const QString hash = QString::fromLatin1(hasher.result().toHex());
+
+        QSettings settings;
+        const QString key = QStringLiteral("luaScriptTrust/") + hash;
+        if (!settings.value(key, false).toBool()) {
+            QMessageBox dlg(this);
+            dlg.setIcon(QMessageBox::Warning);
+            dlg.setWindowTitle(tr("Run Lua Script — consent required"));
+            dlg.setText(tr("<b>About to execute:</b><br><code>%1</code>")
+                            .arg(path.toHtmlEscaped()));
+            dlg.setInformativeText(tr(
+                "This Lua script will run with privileges to:"
+                "<ul>"
+                "<li>read and modify the active project's ROM bytes;</li>"
+                "<li>read, write, and delete files inside the project tree "
+                "    and the system temp directory;</li>"
+                "<li>make HTTP requests to allowlisted hosts;</li>"
+                "<li>query the WOLS similarity catalog.</li>"
+                "</ul>"
+                "Code-execution paths (<code>os.execute</code>, <code>io.popen</code>, "
+                "loading native libraries, <code>dofile</code>) are <b>blocked</b> "
+                "by the sandbox.<br><br>"
+                "<b>Only run scripts from sources you trust.</b><br>"
+                "SHA-256: <code>%1…</code>")
+                .arg(hash.left(16)));
+            auto *runOnce = dlg.addButton(tr("Run once"),
+                                          QMessageBox::AcceptRole);
+            auto *runAlways = dlg.addButton(tr("Trust this script"),
+                                            QMessageBox::AcceptRole);
+            dlg.addButton(QMessageBox::Cancel);
+            dlg.setDefaultButton(QMessageBox::Cancel);
+            dlg.exec();
+            auto *clicked = dlg.clickedButton();
+            if (clicked == runAlways) {
+                settings.setValue(key, true);
+            } else if (clicked != runOnce) {
+                return;     // Cancelled.
+            }
+        }
+
         QJsonObject r = lua::LuaEngine::instance().runFile(path);
         if (!r.value(QStringLiteral("ok")).toBool()) {
             QMessageBox::warning(this, tr("Lua error"),

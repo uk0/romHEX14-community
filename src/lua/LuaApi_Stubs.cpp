@@ -275,7 +275,11 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         return true;
     });
 
-    L.set_function("projectMail", [](sol::variadic_args) -> bool { return false; });
+    // P0-7: honest false + GetLastError instead of silent failure.
+    L.set_function("projectMail", [engine](sol::variadic_args) -> bool {
+        if (engine) engine->setLastError("projectMail not implemented in community build");
+        return false;
+    });
 
     // ── §5.2 find/replace bytes — REAL ──
     // Parse a hex-string pattern with ?? wildcards into (bytes, mask).
@@ -680,9 +684,15 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     L.set_function("projectFindSimilarProjectsSql", findSimilarImpl);
     L.set_function("projectFindSimilarProjects",    findSimilarImpl);  // obsolete alias
 
-    // ── §5.2 rights — OUT OF SCOPE ──
-    L.set_function("projectSetRight",      [](sol::variadic_args) -> bool { return false; });
-    L.set_function("projectSetRightsOwner",[](sol::variadic_args) -> bool { return false; });
+    // ── §5.2 rights — OUT OF SCOPE (P0-7: honest false + GetLastError) ──
+    L.set_function("projectSetRight",      [engine](sol::variadic_args) -> bool {
+        if (engine) engine->setLastError("projectSetRight not implemented in community build");
+        return false;
+    });
+    L.set_function("projectSetRightsOwner",[engine](sol::variadic_args) -> bool {
+        if (engine) engine->setLastError("projectSetRightsOwner not implemented in community build");
+        return false;
+    });
 
     // ── §5.2 projectImportChanges — REAL ──
     //
@@ -867,8 +877,15 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         }
         return 3;   // full ok
     });
-    L.set_function("projectAutoUpdate",    [](sol::variadic_args) -> bool { return false; });
-    L.set_function("projectAutoImport",    [](sol::variadic_args) -> bool { return false; });
+    // P0-7: honest false + GetLastError.
+    L.set_function("projectAutoUpdate",    [engine](sol::variadic_args) -> bool {
+        if (engine) engine->setLastError("projectAutoUpdate not implemented in community build");
+        return false;
+    });
+    L.set_function("projectAutoImport",    [engine](sol::variadic_args) -> bool {
+        if (engine) engine->setLastError("projectAutoImport not implemented in community build");
+        return false;
+    });
 
     // ── §5.2 vehicle data — REAL via EcuAutoDetect ──
     L.set_function("projectSearchVehicleData", [engine]() -> bool {
@@ -894,7 +911,11 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         p->modified = true;
         return true;
     });
-    L.set_function("projectCloneVehicleData",  [](sol::variadic_args) -> bool { return false; });
+    // P0-7: honest false + GetLastError.
+    L.set_function("projectCloneVehicleData",  [engine](sol::variadic_args) -> bool {
+        if (engine) engine->setLastError("projectCloneVehicleData not implemented in community build");
+        return false;
+    });
 
     // ── §5.2 QuickFix — STUB-MISSING per manual §2.4.50-52 ──
     L.set_function("projectGetQuickFixState", [](sol::variadic_args) -> int { return -2; });

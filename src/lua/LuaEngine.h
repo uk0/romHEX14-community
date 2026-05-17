@@ -48,6 +48,20 @@ public:
 
     MainWindow *mainWindow() const { return m_mw; }
 
+    // ── P0-4/5 busy-state guard ─────────────────────────────────────────
+    //
+    // Set to true while a script is executing (incl. inside Sleep /
+    // HttpExecute event-loop pumps).  MainWindow disables destructive
+    // actions (Close Project, Quit, tab close) while this is true so
+    // a re-entrant slot can't invalidate the raw Project* a binding is
+    // holding.  Read-only from C++; bindings call beginScript/endScript.
+    bool isScriptRunning() const { return m_scriptDepth > 0; }
+    void beginScript();
+    void endScript();
+
+signals:
+    void scriptRunningChanged(bool running);
+
 private:
     LuaEngine();
     ~LuaEngine() override;
@@ -56,6 +70,7 @@ private:
     MainWindow    *m_mw   = nullptr;
     QString        m_output;
     QString        m_lastError;
+    int            m_scriptDepth = 0;   // P0-4/5: re-entrant runFile/runString
 };
 
 } // namespace lua

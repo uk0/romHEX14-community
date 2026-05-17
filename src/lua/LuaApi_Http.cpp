@@ -25,6 +25,12 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QByteArray>
+#include <QAbstractButton>
+#include <QHostAddress>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QSettings>
+#include <QSet>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QDebug>
@@ -55,6 +61,74 @@ HttpState &httpState()
 QString toQ(const std::string &s) { return QString::fromUtf8(s.c_str(), int(s.size())); }
 std::string toS(const QString &q) { auto a = q.toUtf8(); return std::string(a.constData(), size_t(a.size())); }
 
+// ── P0-2: host allowlist gate ──────────────────────────────────────────
+//
+// `HttpAddFile` will upload any local file to the URL set by HttpStart, so
+// a malicious script could exfiltrate `.rx14proj` files or the catalog
+// fingerprint database to an attacker-controlled host.  We mitigate by
+// gating the host:
+//
+//   - Loopback (127.0.0.0/8, ::1, localhost) is always allowed — no
+//     external exposure, and our test suite uses it.
+//   - Under RX14_LUA_TEST=1 (headless test runs) anything is allowed.
+//   - Hosts remembered via QSettings are allowed silently.
+//   - Otherwise a modal prompt asks the user, with a checkbox to remember.
+//
+// The check is invoked at HttpStart time so the user sees the destination
+// before any data is queued.
+bool isLoopback(const QString &host)
+{
+    if (host.isEmpty()) return false;
+    const QString h = host.toLower();
+    if (h == QLatin1String("localhost")) return true;
+    QHostAddress addr(host);
+    if (addr.isNull()) return false;
+    return addr.isLoopback();
+}
+
+QSet<QString> &sessionAllowedHosts()
+{
+    static QSet<QString> s;
+    return s;
+}
+
+bool hostGate(const QString &host)
+{
+    if (host.isEmpty()) return false;
+    if (isLoopback(host)) return true;
+    if (qgetenv("RX14_LUA_TEST") == "1") return true;
+    if (sessionAllowedHosts().contains(host.toLower())) return true;
+    QSettings settings;
+    const QString key = QStringLiteral("luaHttpAllowedHosts/") + host.toLower();
+    if (settings.value(key, false).toBool()) return true;
+
+    QMessageBox dlg;
+    dlg.setIcon(QMessageBox::Warning);
+    dlg.setWindowTitle(QObject::tr("Lua script wants HTTP access"));
+    dlg.setText(QObject::tr("<b>Allow HTTP request to:</b><br><code>%1</code>?")
+                    .arg(host.toHtmlEscaped()));
+    dlg.setInformativeText(QObject::tr(
+        "The script can upload files (including project data) to this host. "
+        "Only allow hosts you trust."));
+    QAbstractButton *once = dlg.addButton(QObject::tr("Allow this time"),
+                                          QMessageBox::AcceptRole);
+    QAbstractButton *always = dlg.addButton(QObject::tr("Always allow this host"),
+                                            QMessageBox::AcceptRole);
+    dlg.addButton(QMessageBox::Cancel);
+    dlg.setDefaultButton(QMessageBox::Cancel);
+    dlg.exec();
+    QAbstractButton *clicked = dlg.clickedButton();
+    if (clicked == always) {
+        settings.setValue(key, true);
+        return true;
+    }
+    if (clicked == once) {
+        sessionAllowedHosts().insert(host.toLower());
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 void bindHttpApi(sol::state &L, LuaEngine *engine)
@@ -64,7 +138,14 @@ void bindHttpApi(sol::state &L, LuaEngine *engine)
 
     // 2.2.8  HttpStart(url, verb="GET") → bool
     L.set_function("HttpStart", [&h](const std::string &url, sol::optional<std::string> verb) -> bool {
-        h.url = toQ(url);
+        const QString qurl = toQ(url);
+        const QString host = QUrl(qurl).host();
+        if (!hostGate(host)) {
+            h.url.clear();                              // block downstream calls
+            h.lastError = QStringLiteral("HTTP host '%1' not allowed").arg(host);
+            return false;
+        }
+        h.url = qurl;
         h.verb = verb ? toQ(*verb) : QStringLiteral("GET");
         h.headers.clear();
         h.params.clear();

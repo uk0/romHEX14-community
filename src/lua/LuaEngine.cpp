@@ -21,6 +21,9 @@
 
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
+#include <QRegularExpression>
+#include <QStandardPaths>
 #include <QMessageBox>
 #include <QApplication>
 #include <QDebug>
@@ -65,6 +68,96 @@ void LuaEngine::initialize(MainWindow *mw)
         sol::lib::os,
         sol::lib::package
     );
+
+    // ── Sandbox (P0-1) ──────────────────────────────────────────────────
+    //
+    // The Lua stdlibs ship with several functions that give a malicious
+    // script full RCE / data-exfiltration capability on the host machine:
+    //
+    //   CODE-EXEC (always blocked — no legit user-script use):
+    //     - os.execute / io.popen → run arbitrary shell commands
+    //     - os.exit → terminate the host application
+    //     - package.loadlib → load and call any native .so/.dll/.dylib
+    //     - dofile / loadfile / load → load arbitrary Lua bytecode from
+    //                                  disk or from a string (can also
+    //                                  crash the interpreter)
+    //
+    //   FILESYSTEM (path-guarded — legitimate use for temp files):
+    //     - os.remove / os.rename / os.tmpname → tamper with the FS
+    //   Replaced with versions that only accept paths inside the system
+    //   temp directory OR under the current working directory (and never
+    //   containing `..` segments).
+    //
+    // Scripts that need to read/write regular files can still use
+    // io.open(); script composition is still possible via require() within
+    // the package.path we control.
+    {
+        sol::table os_tbl  = L["os"];
+        sol::table io_tbl  = L["io"];
+        sol::table pkg_tbl = L["package"];
+
+        // Path guard — returns canonicalised absolute path if safe, or
+        // empty string if the path would escape the sandbox.
+        auto guardPath = [](const std::string &raw) -> QString {
+            QString p = QString::fromStdString(raw);
+            if (p.isEmpty()) return QString();
+            // Refuse parent-directory traversal at the syntactic level
+            // even if Qt would canonicalise it away — defence in depth.
+            const auto parts = p.split(QRegularExpression(
+                QStringLiteral("[\\\\/]")), Qt::SkipEmptyParts);
+            for (const auto &seg : parts) if (seg == QStringLiteral(".."))
+                return QString();
+            QFileInfo fi(p);
+            const QString abs = fi.absoluteFilePath();
+            const QString cwd = QDir::currentPath();
+            const QString tmp = QDir::tempPath();
+            const auto cs =
+#ifdef Q_OS_WIN
+                Qt::CaseInsensitive;
+#else
+                Qt::CaseSensitive;
+#endif
+            if (abs.startsWith(cwd, cs)) return abs;
+            if (abs.startsWith(tmp, cs)) return abs;
+            return QString();
+        };
+
+        if (os_tbl.valid()) {
+            os_tbl["execute"] = sol::nil;
+            os_tbl["exit"]    = sol::nil;
+            os_tbl["remove"] = [guardPath](const std::string &path) -> bool {
+                const QString safe = guardPath(path);
+                if (safe.isEmpty()) return false;
+                return QFile::remove(safe);
+            };
+            os_tbl["rename"] = [guardPath](const std::string &from,
+                                           const std::string &to) -> bool {
+                const QString f = guardPath(from);
+                const QString t = guardPath(to);
+                if (f.isEmpty() || t.isEmpty()) return false;
+                return QFile::rename(f, t);
+            };
+            os_tbl["tmpname"] = []() -> std::string {
+                // Create a real file in the system temp dir so subsequent
+                // os.remove() (path-guarded above) accepts it.
+                QString tpl = QDir::tempPath() + QStringLiteral("/rx14_XXXXXX");
+                QFile f(tpl);
+                if (!f.open(QIODevice::WriteOnly)) return std::string();
+                const QString p = f.fileName();
+                f.close();
+                return p.toStdString();
+            };
+        }
+        if (io_tbl.valid()) {
+            io_tbl["popen"] = sol::nil;
+        }
+        if (pkg_tbl.valid()) {
+            pkg_tbl["loadlib"] = sol::nil;
+        }
+        L["dofile"]   = sol::nil;
+        L["loadfile"] = sol::nil;
+        L["load"]     = sol::nil;
+    }
 
     // Redirect Lua's `print` to our captured-output buffer.
     L.set_function("print", [this](sol::variadic_args va) {
@@ -128,8 +221,10 @@ QJsonObject LuaEngine::runFile(const QString &path)
     m_lastError.clear();
     auto &L = m_impl->L;
 
+    beginScript();
     sol::protected_function_result rc = L.safe_script_file(
         path.toStdString(), sol::script_pass_on_error);
+    endScript();
 
     QString output = takeOutput();
     if (!rc.valid()) {
@@ -152,14 +247,27 @@ bool LuaEngine::runString(const QString &chunk, QString *err)
         if (err) *err = QStringLiteral("LuaEngine not initialized");
         return false;
     }
+    beginScript();
     sol::protected_function_result rc =
         m_impl->L.safe_script(chunk.toStdString(), sol::script_pass_on_error);
+    endScript();
     if (!rc.valid()) {
         sol::error e = rc;
         if (err) *err = QString::fromUtf8(e.what());
         return false;
     }
     return true;
+}
+
+void LuaEngine::beginScript()
+{
+    if (++m_scriptDepth == 1) emit scriptRunningChanged(true);
+}
+
+void LuaEngine::endScript()
+{
+    if (m_scriptDepth > 0 && --m_scriptDepth == 0)
+        emit scriptRunningChanged(false);
 }
 
 QString LuaEngine::takeOutput()
