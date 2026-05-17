@@ -1470,3 +1470,195 @@ Project *Project::open(const QString &path, QObject *parent)
     f.close();
     return openLegacyJson(path, parent);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Sprint L §5.0.1 — WinOLS Lua property bridge
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Switch over numeric IDs defined in src/lua/LuaPropertyIds.h.  The Lua side
+// (LuaConstants.cpp) exposes the same numeric values as globals.  Mapping
+// per Sprint L spec §5.2a.
+
+#include "lua/LuaPropertyIds.h"
+#include <QCryptographicHash>
+
+QString Project::propertyById(int id, int iOrgVer) const
+{
+    using namespace lua_ids;
+    switch (id) {
+    // ── Client ──
+    case ePrjPropClientName:         return clientName;
+    case ePrjPropClientNumber:       return clientNr;
+    case ePrjPropClientLicenceplace: return clientLicence;
+    // ── Vehicle ──
+    case ePrjPropVehicleType:        return vehicleType;
+    case ePrjPropVehicleProducer:    return brand;
+    case ePrjPropVehicleChassis:     return vehicleBuild;
+    case ePrjVehicleBuild:           return vehicleBuild;
+    case ePrjPropVehicleModel:       return model;
+    case ePrjVehicleCharacteristic:  return vehicleCharacteristic;
+    case ePrjPropVehicleModelyear:   return (year > 0) ? QString::number(year) : QString();
+    case ePrjPropVehicleVIN:         return vin;
+    // ── ECU ──
+    case ePrjPropEcuProducer:        return ecuProducer;
+    case ePrjPropEcuBuild:           return ecuType;
+    case ePrjPropEcuProdNr:          return ecuNrProd;
+    case ePrjPropEcuStgNr:           return ecuNrEcu;
+    case ePrjPropEcuSoftwareversion: return ecuSwNumber;
+    case ePrjPropEcuSoftwareversionVersion: return ecuSwVersion;
+    case ePrjPropEcuChecksum:        return ecuChecksum;
+    case ePrjPropEcuSoftwaresize:    return QString::number(originalData.size());
+    case ePrjPropEcuUse:             return ecuUse;
+    // ── Engine ──
+    case ePrjPropEngineName:         return engineCode;
+    case ePrjPropEngineType:         return engineType;
+    case ePrjPropEngineDisplacement: return displacement;
+    case ePrjPropEngineTransmission: return transmission;
+    case ePrjPropEngineOutputPS:     return (outputPS > 0) ? QString::number(outputPS) : QString();
+    case ePrjPropEngineOutputKW:     return (outputKW > 0) ? QString::number(outputKW) : QString();
+    case ePrjPropEngineEmissionStd:  return emission;
+    case ePrjPropEngineTorque:       return (maxTorque > 0) ? QString::number(maxTorque) : QString();
+    // ── Status ──
+    case ePrjPropProjectType:        return projectType;
+    case ePrjProjectStatus: {
+        // Iter 10.3: return integer code per manual so scripts can do
+        // `1*projectGetProperty(ePrjProjectStatus) == ePrjDeveloping`.
+        // ePrjDeveloping=1, ePrjFinished=2, ePrjMaster=3 (LuaPropertyIds.h).
+        const QString p = projectType.toLower();
+        int v = 1;   // ePrjDeveloping (default)
+        if      (p.contains(QStringLiteral("master")))   v = 3;
+        else if (p.contains(QStringLiteral("finished"))) v = 2;
+        return QString::number(v);
+    }
+    // ── File metadata ──
+    case ePrjFileCreatedBy:          return createdBy;
+    case ePrjFileModifiedBy:         return changedBy;
+    case ePrjFileCreatedOn:          return createdAt.toString(Qt::ISODate);
+    case ePrjFileModifiedOn:         return changedAt.toString(Qt::ISODate);
+    case ePrjComment:                return notes;
+    // ── Userdef ──
+    case ePrjUserdef1:               return user1;
+    case ePrjUserdef2:               return user2;
+    case ePrjUserdef3:               return user3;
+    case ePrjUserdef4:               return user4;
+    case ePrjUserdef5:               return user5;
+    // ── File paths (read-only) ──
+    case ePrjImportFilename:         return romPath;
+    case ePrjImportPath: {
+        int slash = romPath.lastIndexOf(QLatin1Char('/'));
+        int bslash = romPath.lastIndexOf(QLatin1Char('\\'));
+        int cut = qMax(slash, bslash);
+        return (cut > 0) ? romPath.left(cut + 1) : QString();
+    }
+    case ePrjFilename:               return filePath;
+    // ── Original-version checksums (iOrgVer==1 only) ──
+    case ePrjPropChecksumMD5:
+        if (iOrgVer == 1 && !originalData.isEmpty())
+            return QString::fromLatin1(QCryptographicHash::hash(
+                originalData, QCryptographicHash::Md5).toHex());
+        return QString();
+    case ePrjPropChecksumSHA1:
+        if (iOrgVer == 1 && !originalData.isEmpty())
+            return QString::fromLatin1(QCryptographicHash::hash(
+                originalData, QCryptographicHash::Sha1).toHex());
+        return QString();
+    case ePrjPropChecksumSHA256:
+        if (iOrgVer == 1 && !originalData.isEmpty())
+            return QString::fromLatin1(QCryptographicHash::hash(
+                originalData, QCryptographicHash::Sha256).toHex());
+        return QString();
+    // ── STUB-MISSING (no backing field) ──
+    case ePrjPropCommunicationsReadhardware:
+    case ePrjPropNoreadTag:
+    case ePrjPropSpiTag:
+    case ePrjPropBdmTag:
+    case ePrjPropUserTag:
+    case ePrjPropUserTagText:
+    case ePrjPropResellerCredits:
+    case ePrjPropResellerProjectType:
+    case ePrjPropResellerProjectDetails:
+    case ePrjPropChecksum8Bit:
+    case ePrjPropChecksum8BitCpu:
+    case ePrjPropChecksum8BitEpr:
+    case ePrjPropChecksumMD5Cpu:
+    case ePrjPropChecksumMD5Epr:
+        return QString();
+    default:
+        m_lastError = QStringLiteral("unknown property id %1").arg(id);
+        return QString();
+    }
+}
+
+bool Project::setPropertyById(int id, const QString &value)
+{
+    using namespace lua_ids;
+    // Read-only ids per WinOLS manual §2.4.2
+    if (id == ePrjPropEcuSoftwaresize
+     || id == ePrjPropEcuChecksum
+     || id == ePrjFileCreatedOn
+     || id == ePrjFileModifiedOn
+     || id == ePrjImportFilename
+     || id == ePrjImportPath
+     || id == ePrjFilename) {
+        m_lastError = QStringLiteral("property %1 is read-only").arg(id);
+        return false;
+    }
+    bool ok = true;
+    switch (id) {
+    case ePrjPropClientName:         clientName = value; break;
+    case ePrjPropClientNumber:       clientNr = value; break;
+    case ePrjPropClientLicenceplace: clientLicence = value; break;
+    case ePrjPropVehicleType:        vehicleType = value; break;
+    case ePrjPropVehicleProducer:    brand = value; break;
+    case ePrjPropVehicleChassis:     vehicleBuild = value; break;
+    case ePrjVehicleBuild:           vehicleBuild = value; break;
+    case ePrjPropVehicleModel:       model = value; break;
+    case ePrjVehicleCharacteristic:  vehicleCharacteristic = value; break;
+    case ePrjPropVehicleModelyear:   year = value.toInt(); break;
+    case ePrjPropVehicleVIN:         vin = value; break;
+    case ePrjPropEcuProducer:        ecuProducer = value; break;
+    case ePrjPropEcuBuild:           ecuType = value; break;
+    case ePrjPropEcuProdNr:          ecuNrProd = value; break;
+    case ePrjPropEcuStgNr:           ecuNrEcu = value; break;
+    case ePrjPropEcuSoftwareversion: ecuSwNumber = value; break;
+    case ePrjPropEcuSoftwareversionVersion: ecuSwVersion = value; break;
+    case ePrjPropEcuUse:             ecuUse = value; break;
+    case ePrjPropEngineName:         engineCode = value; break;
+    case ePrjPropEngineType:         engineType = value; break;
+    case ePrjPropEngineDisplacement: displacement = value; break;
+    case ePrjPropEngineTransmission: transmission = value; break;
+    case ePrjPropEngineOutputPS:     outputPS = value.toInt(); break;
+    case ePrjPropEngineOutputKW:     outputKW = value.toInt(); break;
+    case ePrjPropEngineEmissionStd:  emission = value; break;
+    case ePrjPropEngineTorque:       maxTorque = value.toInt(); break;
+    case ePrjPropProjectType:        projectType = value; break;
+    case ePrjFileCreatedBy:          createdBy = value; break;
+    case ePrjFileModifiedBy:         changedBy = value; break;
+    case ePrjComment:                notes = value; break;
+    case ePrjUserdef1:               user1 = value; break;
+    case ePrjUserdef2:               user2 = value; break;
+    case ePrjUserdef3:               user3 = value; break;
+    case ePrjUserdef4:               user4 = value; break;
+    case ePrjUserdef5:               user5 = value; break;
+    // STUB-MISSING — accept but discard (no backing field)
+    case ePrjPropCommunicationsReadhardware:
+    case ePrjPropNoreadTag:
+    case ePrjPropSpiTag:
+    case ePrjPropBdmTag:
+    case ePrjPropUserTag:
+    case ePrjPropUserTagText:
+    case ePrjPropResellerCredits:
+    case ePrjPropResellerProjectType:
+    case ePrjPropResellerProjectDetails:
+        break;
+    default:
+        m_lastError = QStringLiteral("unknown property id %1").arg(id);
+        ok = false;
+        break;
+    }
+    if (ok) {
+        modified = true;
+        changedAt = QDateTime::currentDateTime();
+    }
+    return ok;
+}

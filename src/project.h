@@ -272,6 +272,21 @@ public:
     QString listLabel() const;   // "filename (Brand Model · ECU · year)" — for tree/list views
     QString fullTitle() const;   // "filename — Brand Model — ECU (year)" — for window titles
 
+    // ── WinOLS Lua property bridge (Sprint L §5.0.1) ─────────────────────────
+    // Read a property identified by a WinOLS ePrjProp* enum integer (defined
+    // in src/lua/LuaConstants.cpp).  Returns "" for unmapped / STUB-MISSING
+    // ids.  See Sprint L spec §5.2a for the full mapping table.
+    QString propertyById(int ePrjPropId, int iOrgVer = 0) const;
+
+    // Write a property by enum id.  Returns false for read-only ids
+    // (ePrjPropEcuSoftwaresize, ePrjPropEcuChecksum, ePrjFileCreatedOn,
+    // ePrjFileModifiedOn) per WinOLS manual §2.4.2, and for unmapped ids.
+    bool setPropertyById(int ePrjPropId, const QString &value);
+
+    // Lua's GetLastError() pulls from here.
+    QString lastError() const { return m_lastError; }
+    void    setLastError(const QString &msg) { m_lastError = msg; }
+
 signals:
     void dataChanged();
     void versionsChanged();
@@ -279,4 +294,5 @@ signals:
 
 private:
     class AnnotationStore *m_annotations = nullptr;
+    mutable QString m_lastError;
 };

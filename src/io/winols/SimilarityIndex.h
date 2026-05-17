@@ -35,6 +35,7 @@
 #pragma once
 
 #include "io/winols/RomFingerprint.h"
+#include "io/winols/RomChunkFingerprint.h"
 
 #include <QHash>
 #include <QObject>
@@ -54,13 +55,24 @@ struct IndexedFile {
     qint64   size = 0;
     qint64   mtime = 0;
     qint64   bytesScanned = 0;
-    RomFingerprint fp;
+    RomFingerprint      fp;
+    RomChunkFingerprint chunkFp;        // CHUNK.3: byte-twin fingerprint
 };
 
 struct SimilarityMatch {
     QString  path;
     qint64   size = 0;
     SimilarityScore score;
+};
+
+/// CHUNK byte-twin match — fraction of needle's 16 KB chunks that the
+/// haystack file also contains.  1.0 means every needle chunk found.
+struct ChunkMatch {
+    QString  path;
+    qint64   size           = 0;
+    int      needleChunks   = 0;
+    int      matchedChunks  = 0;
+    double   containment    = 0.0;   // matchedChunks / needleChunks
 };
 
 class SimilarityIndex : public QObject {
@@ -110,6 +122,24 @@ public:
     /// Look up a single row by path.  Empty `IndexedFile` if missing.
     IndexedFile lookup(const QString &path) const;
 
+    // ── Chunk fingerprint API (CHUNK.2+) ─────────────────────────────────
+
+    /// Store the chunk fingerprint for @p path, replacing any prior data.
+    /// Returns false on SQL error.
+    bool upsertChunkFingerprint(const QString &path,
+                                qint64 size, qint64 mtime,
+                                const RomChunkFingerprint &fp);
+
+    /// Number of files indexed in the chunk inverted index.
+    int  chunkFileCount() const;
+
+    /// Containment lookup — for each chunk hash in @p needle, find files
+    /// containing it; rank by chunks_matched / needle_chunk_count.
+    /// Returns up to @p limit matches with containment ≥ @p minContainment.
+    QVector<ChunkMatch> findByteSimilar(const RomChunkFingerprint &needle,
+                                        double minContainment = 0.5,
+                                        int    limit          = 200) const;
+
 signals:
     /// Emitted from the rebuild thread.  @p processed counts files
     /// touched (incl. skipped); @p totalBytes is cumulative file
@@ -128,6 +158,12 @@ private:
 
     bool createSchemaIfNeeded(QSqlDatabase &db, QString *err) const;
     void upsert(QSqlDatabase &db, const IndexedFile &f) const;
+    // Inner upsert that uses the caller's open transaction (used by the
+    // parallel rebuild path).  Returns false on SQL error.
+    bool upsertChunkFingerprintInner(QSqlDatabase &db,
+                                     const QString &path,
+                                     qint64 size, qint64 mtime,
+                                     const RomChunkFingerprint &fp) const;
     static QStringList enumerate(const QStringList &roots);
 };
 

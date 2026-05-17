@@ -65,6 +65,18 @@ public:
 
     enum class PanelFilter { All, Modified, Starred, Recent, TypeValue, TypeCurve, TypeMap };
 
+    // ── Sprint L Lua bridge accessors (need public visibility) ──
+    Project *luaActiveProject() const;     // public wrapper over private activeProject()
+    void     luaNewProject();              // public wrapper over private actNewProject()
+    int      luaSaveAllProjects();         // returns count of projects saved
+    int      luaCloseAllProjects();        // returns count of sub-windows closed
+    // Non-interactive close — delegates to the existing eventFilter +
+    // finalizeClosedProject deferred-cleanup machinery so back-to-back Lua
+    // calls don't trip the access-violation race documented at
+    // finalizeClosedProject().  Returns true if a project was closed.
+    bool     luaCloseActiveProject(bool deleteFile);
+    struct MapInfo *m_luaLastCreatedMap = nullptr;   // set by Lua's projectAddMap
+
 #ifdef RX14_DEBUG_RPC
     // ── Debug RPC entry points ────────────────────────────────────────────
     // Called from DebugRpc on the Qt main thread.  All return QJsonObject /

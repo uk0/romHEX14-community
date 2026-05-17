@@ -1,0 +1,6 @@
+*.bin
+*.csv
+*.json
+tmp_*
+!.gitignore
+!README.md

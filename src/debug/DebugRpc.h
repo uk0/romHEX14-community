@@ -68,6 +68,7 @@ private:
     QJsonObject cmdUndo(const QJsonObject &args);
     QJsonObject cmdRemoveAnno(const QJsonObject &args);
     QJsonObject cmdDumpOlsRom(const QJsonObject &args);
+    QJsonObject cmdRunLua(const QJsonObject &args);     // Sprint L §5.0.5
 
     MainWindow *m_mw = nullptr;
     QTcpServer *m_server = nullptr;

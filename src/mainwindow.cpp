@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "appconstants.h"
+#include "lua/LuaEngine.h"
 #include "hexcomparedlg.h"
 #include "diffpanel.h"
 #include "savepoints/SavepointManager.h"
@@ -12,6 +13,9 @@
 #include "io/winols/SimilarityIndex.h"
 #include "io/winols/WinOlsConfig.h"
 #include "io/winols/OlsCfgParser.h"
+#include "io/legion/LegionDlg.h"
+#include "io/legion/Legion.h"
+#include <QCryptographicHash>
 #include "savepoints/SavepointsPanel.h"
 #include "debug/DebugLog.h"
 #include <QDockWidget>
@@ -363,6 +367,28 @@ MainWindow::MainWindow(QWidget *parent)
     m_mdi->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     m_mdi->setBackground(QBrush(QColor(0x08, 0x0b, 0x10)));
     m_mainSplitter->addWidget(m_mdi);
+
+    // Sprint L Iter 1 — initialize embedded Lua engine.
+    // Safe to call here: MDI exists, MainWindow itself is `this`.
+    lua::LuaEngine::instance().initialize(this);
+
+    // P0-4/5: lock destructive UI while a Lua script is running.  The
+    // bindings hold raw Project* pointers across QEventLoop pumps
+    // (HttpExecute / Sleep / MessagePump) so a Close-Project click in the
+    // middle would dangle them.  Disabling the action is the smallest
+    // change that closes the race without rearchitecting threading.
+    connect(&lua::LuaEngine::instance(),
+            &lua::LuaEngine::scriptRunningChanged,
+            this, [this](bool running) {
+        if (m_actClose) m_actClose->setEnabled(!running);
+        if (running) {
+            statusBar()->showMessage(
+                tr("Lua script running — close-project disabled until it returns."),
+                0);
+        } else {
+            statusBar()->clearMessage();
+        }
+    });
 
     // ── AI Assistant right panel ──────────────────────────────────────
     m_aiAssistant = new AIAssistant(this);
@@ -2653,6 +2679,74 @@ void MainWindow::retranslateUi()
     m_menuFind->addSeparator();
     m_menuFind->addAction(tr("Find &Similar Files…"),
                           this, &MainWindow::actFindSimilarFiles);
+    m_menuFind->addAction(tr("Summon &LEGION…"), this, [this]() {
+        Project *p = activeProject();
+        if (!p || p->currentData.isEmpty()) {
+            statusBar()->showMessage(
+                tr("Open a project first to summon the legion."), 4000);
+            return;
+        }
+        auto *dlg = new legion::LegionDlg(p, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(dlg, &QDialog::accepted, this, [this, dlg, p]() {
+            const auto verdicts = dlg->selectedVerdicts();
+            if (verdicts.isEmpty()) return;
+
+            // Bounding box of touched bytes — single undo entry covers it.
+            uint32_t lo = std::numeric_limits<uint32_t>::max(), hi = 0;
+            for (const auto &v : verdicts) {
+                if (v.startAddr < lo) lo = v.startAddr;
+                if (v.endAddr   > hi) hi = v.endAddr;
+            }
+            if (hi < lo || hi >= uint32_t(p->currentData.size())) {
+                statusBar()->showMessage(
+                    tr("LEGION: nothing applicable in this ROM."), 4000);
+                return;
+            }
+            const int spanLen = int(hi - lo + 1);
+            const QByteArray before = p->currentData.mid(int(lo), spanLen);
+            int totalChanged = 0;
+            for (const auto &v : verdicts) {
+                totalChanged += legion::applyVerdict(p->currentData, v);
+            }
+            const QByteArray after = p->currentData.mid(int(lo), spanLen);
+
+            // Each view keeps its OWN byte buffer:
+            //   - Project::currentData (we just wrote into this)
+            //   - WaveformWidget::m_data (waveform-editor backing store)
+            //   - HexWidget::m_data + m_modifications set
+            //
+            // ProjectView's existing WaveformWidget::dataModified handler
+            // copies wave→project on every edit; if we skip resyncing
+            // wave first, that copy would clobber the LEGION writes with
+            // STALE wave bytes.  HexWidget also needs an explicit refresh
+            // so the new diff-vs-original highlights (m_modifications) get
+            // recomputed.
+            ProjectView *pv = activeView();
+            WaveformWidget *ww = pv ? pv->waveformWidget() : nullptr;
+            WaveformEditor *ed = ww ? ww->editor() : nullptr;
+
+            if (ww) ww->showROM(p->currentData, p->originalData);
+            if (pv && pv->hexWidget())
+                pv->hexWidget()->refreshData(p->currentData);
+
+            // Route the undo entry through the editor so Ctrl+Z reverts
+            // the whole LEGION batch in one shot.  emitModified fires
+            // dataModified, but with wave now in sync the ProjectView
+            // handler's memcmp short-circuits — no clobber.
+            if (ed) {
+                ed->submitExternal(int(lo), before, after);
+            }
+            p->modified = true;
+            emit p->dataChanged();
+            statusBar()->showMessage(
+                tr("LEGION: %1 verdicts applied (%2 bytes changed). Ctrl+Z to undo.")
+                .arg(verdicts.size()).arg(totalChanged), 6000);
+        });
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
     m_menuFind->addSeparator();
     m_menuFind->addAction(m_actInsertComment);
     m_menuFind->addAction(m_actInsertMarker);
@@ -7020,6 +7114,77 @@ void MainWindow::actFindSimilarFiles()
         qCInfo(catFind) << "openSimilarRequested done; total="
                         << total.elapsed() << "ms";
     });
+
+    // "Open as comparison" — same import flow as Open, then pop the
+    // existing Compare-Hex dialog so the user lands directly in diff view.
+    connect(dlg, &winols::SimilarFilesDlg::compareWithRequested,
+            this, [this](const QString &path) {
+        qCInfo(catFind) << "compareWithRequested path=" << path;
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) {
+            QMessageBox::warning(this, tr("Open as comparison"),
+                tr("Could not read file: %1").arg(f.errorString()));
+            return;
+        }
+        const QByteArray fileData = f.readAll();
+        f.close();
+        if (fileData.isEmpty()) {
+            QMessageBox::warning(this, tr("Open as comparison"),
+                tr("File is empty: %1").arg(path));
+            return;
+        }
+        ols::OlsImportResult result;
+        try { result = ols::OlsImporter::importFromBytes(fileData); }
+        catch (const std::exception &e) {
+            QMessageBox::critical(this, tr("Import error"),
+                tr("OLS import threw: %1").arg(QString::fromUtf8(e.what())));
+            return;
+        } catch (...) {
+            QMessageBox::critical(this, tr("Import error"),
+                tr("OLS import threw an unknown exception"));
+            return;
+        }
+        if (!result.error.isEmpty()) {
+            QMessageBox::critical(this, tr("Import error"), result.error);
+            return;
+        }
+        const auto projects =
+            ols::buildProjectsFromOlsImport(result, path, this);
+        Project *justOpened = nullptr;
+        for (Project *p : projects) {
+            m_projects.append(p);
+            openProject(p);
+            if (!justOpened) justOpened = p;
+        }
+        // Auto-pop HexCompareDlg with the active project on the left and
+        // the newly-opened file on the right.
+        if (justOpened) {
+            // Defer the HexCompareDlg creation until after the MDI cascade
+            // from openProject() above settles.  Showing a top-level dialog
+            // mid-cascade has crashed in QMdiArea::resizeEvent on some
+            // builds (likely a QPointer-into-deleted-subwindow race).
+            QPointer<MainWindow> self = this;
+            QPointer<Project>    rightP = justOpened;
+            QTimer::singleShot(0, this, [self, rightP]() {
+                if (!self || !rightP) return;
+                Project *leftP = nullptr;
+                for (Project *p : self->m_projects)
+                    if (p && p != rightP) { leftP = p; break; }
+                auto *cmp = new HexCompareDlg(
+                    QList<Project *>(self->m_projects.begin(),
+                                     self->m_projects.end()),
+                    leftP, self.data(), rightP.data());
+                cmp->setAttribute(Qt::WA_DeleteOnClose);
+                cmp->show();
+                cmp->raise();
+                cmp->activateWindow();
+            });
+        }
+        statusBar()->showMessage(
+            tr("Opened %1 as comparison.").arg(QFileInfo(path).fileName()),
+            4000);
+    });
+
     dlg->show();
     dlg->raise();
     dlg->activateWindow();
@@ -7433,7 +7598,12 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *ev)
     // Modified project → ask the user before letting Qt close the window.
     // The save / discard / cancel dialog is synchronous; everything below
     // deferred to a singleShot.
-    if (proj->modified) {
+    //
+    // Iter 8.2 v2: under RX14_LUA_TEST=1 (the headless RPC test harness)
+    // we MUST NOT show modals — they block the Qt event loop forever
+    // because nobody is on the keyboard.  Treat modified as "discard" so
+    // close proceeds non-interactively.
+    if (proj->modified && qgetenv("RX14_LUA_TEST") != "1") {
         QMessageBox mb(this);
         mb.setWindowTitle(tr("Close Project"));
         mb.setText(QString("<b>%1</b>").arg(proj->fullTitle()));
@@ -8991,10 +9161,76 @@ void MainWindow::runBulkEdit(const QVector<MapInfo> &maps)
         tr("Bulk edit applied to %1 maps").arg(maps.size()), 6000);
 }
 
+// ── Sprint L Lua bridge ─────────────────────────────────────────────────────
+Project *MainWindow::luaActiveProject() const
+{
+    return activeProject();   // delegate to existing private impl
+}
+
+void MainWindow::luaNewProject()
+{
+    // Headless equivalent of "File → New Project": create a Project,
+    // add it to MainWindow's project list, and open a sub-window for it.
+    // Lua's projectImport(file) then operates on this freshly created project.
+    auto *p = new Project(this);
+    p->name = QStringLiteral("LuaNewProject");
+    p->createdAt = QDateTime::currentDateTime();
+    p->changedAt = p->createdAt;
+    if (m_mdi) openProject(p);
+}
+
+int MainWindow::luaSaveAllProjects()
+{
+    int saved = 0;
+    for (Project *p : m_projects) {
+        if (!p) continue;
+        if (p->filePath.isEmpty()) continue;   // skip in-memory projects
+        if (p->save()) ++saved;
+    }
+    return saved;
+}
+
+int MainWindow::luaCloseAllProjects()
+{
+    if (!m_mdi) return 0;
+    int count = m_mdi->subWindowList().size();
+    m_mdi->closeAllSubWindows();
+    return count;
+}
+
+bool MainWindow::luaCloseActiveProject(bool deleteFile)
+{
+    // Thin wrapper — does NOT touch m_projects directly.  Setting
+    // modified=false skips the "save?" modal in eventFilter(); sw->close()
+    // then triggers eventFilter which schedules finalizeClosedProject() via
+    // QTimer::singleShot(0).  All m_projects/recentMaps/overlays mutation
+    // happens deferred, after MDI's post-close relayout pass — see comment
+    // on finalizeClosedProject() for the race history.
+    if (!m_mdi) return false;
+    auto *sw = m_mdi->activeSubWindow();
+    if (!sw) return false;
+    auto *pv = qobject_cast<ProjectView *>(sw->widget());
+    if (!pv) return false;
+    auto *proj = pv->project();
+    if (!proj) return false;
+
+    const QString path = proj->filePath;
+    proj->modified = false;
+    sw->close();
+
+    if (deleteFile && !path.isEmpty()) {
+        QTimer::singleShot(0, this, [path]{
+            if (QFile::exists(path)) QFile::remove(path);
+        });
+    }
+    return true;
+}
+
 // ── Datalog menu wiring ─────────────────────────────────────────────────────
 
 #include "datalog/LogViewerWindow.h"
 #include "datalog/CompareLogsDialog.h"
+#include "lua/LuaEngine.h"
 
 QStringList MainWindow::datalogRecent() const
 {
@@ -9049,6 +9285,85 @@ void MainWindow::rebuildDatalogMenu()
 
     auto *cmpAct = m_menuDatalog->addAction(tr("&Compare Logs…"));
     connect(cmpAct, &QAction::triggered, this, &MainWindow::compareDatalogs);
+
+    // Sprint L — run an external Lua script through the embedded engine.
+    m_menuDatalog->addSeparator();
+    auto *luaAct = m_menuDatalog->addAction(tr("Run &Lua Script…"));
+    connect(luaAct, &QAction::triggered, this, [this]() {
+        QString path = QFileDialog::getOpenFileName(this,
+            tr("Run Lua Script"), QString(),
+            tr("Lua scripts (*.lua);;All files (*)"));
+        if (path.isEmpty()) return;
+
+        // P0-3 consent gate.  Even with the sandbox in place (P0-1) and
+        // the HTTP allowlist (P0-2), a Lua script can still touch project
+        // bytes, query the catalog, and make file-write side effects
+        // inside the project tree.  Treat a fresh script the same way a
+        // browser treats a fresh executable: require explicit consent.
+        //
+        // Repeat runs of the same exact content are silent — we key
+        // trust on SHA-256 so a malicious edit re-prompts even if the
+        // filename is unchanged.
+        QFile probe(path);
+        if (!probe.open(QIODevice::ReadOnly)) {
+            QMessageBox::warning(this, tr("Run Lua Script"),
+                tr("Could not open %1").arg(path));
+            return;
+        }
+        QCryptographicHash hasher(QCryptographicHash::Sha256);
+        hasher.addData(&probe);
+        probe.close();
+        const QString hash = QString::fromLatin1(hasher.result().toHex());
+
+        QSettings settings;
+        const QString key = QStringLiteral("luaScriptTrust/") + hash;
+        if (!settings.value(key, false).toBool()) {
+            QMessageBox dlg(this);
+            dlg.setIcon(QMessageBox::Warning);
+            dlg.setWindowTitle(tr("Run Lua Script — consent required"));
+            dlg.setText(tr("<b>About to execute:</b><br><code>%1</code>")
+                            .arg(path.toHtmlEscaped()));
+            dlg.setInformativeText(tr(
+                "This Lua script will run with privileges to:"
+                "<ul>"
+                "<li>read and modify the active project's ROM bytes;</li>"
+                "<li>read, write, and delete files inside the project tree "
+                "    and the system temp directory;</li>"
+                "<li>make HTTP requests to allowlisted hosts;</li>"
+                "<li>query the WOLS similarity catalog.</li>"
+                "</ul>"
+                "Code-execution paths (<code>os.execute</code>, <code>io.popen</code>, "
+                "loading native libraries, <code>dofile</code>) are <b>blocked</b> "
+                "by the sandbox.<br><br>"
+                "<b>Only run scripts from sources you trust.</b><br>"
+                "SHA-256: <code>%1…</code>")
+                .arg(hash.left(16)));
+            auto *runOnce = dlg.addButton(tr("Run once"),
+                                          QMessageBox::AcceptRole);
+            auto *runAlways = dlg.addButton(tr("Trust this script"),
+                                            QMessageBox::AcceptRole);
+            dlg.addButton(QMessageBox::Cancel);
+            dlg.setDefaultButton(QMessageBox::Cancel);
+            dlg.exec();
+            auto *clicked = dlg.clickedButton();
+            if (clicked == runAlways) {
+                settings.setValue(key, true);
+            } else if (clicked != runOnce) {
+                return;     // Cancelled.
+            }
+        }
+
+        QJsonObject r = lua::LuaEngine::instance().runFile(path);
+        if (!r.value(QStringLiteral("ok")).toBool()) {
+            QMessageBox::warning(this, tr("Lua error"),
+                                 r.value(QStringLiteral("error")).toString());
+        } else {
+            QString out = r.value(QStringLiteral("output")).toString();
+            if (!out.isEmpty()) {
+                QMessageBox::information(this, tr("Lua output"), out);
+            }
+        }
+    });
 
     QStringList list = datalogRecent();
     if (!list.isEmpty()) {
