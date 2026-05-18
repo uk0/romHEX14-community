@@ -22,7 +22,6 @@
 #include "io/ols/EcuAutoDetect.h"
 #include "io/winols/SimilarityIndex.h"
 #include "io/winols/RomFingerprint.h"
-#include "io/winols/RomChunkFingerprint.h"
 #include "io/legion/Legion.h"
 #include "romparser.h"
 
@@ -1403,37 +1402,6 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
                 out[vi + 1] = row;
             }
             return out;
-        });
-
-    // ── CHUNK.1 ──────────────────────────────────────────────────────────
-    L.set_function("_chunkFingerprint",
-        [&L](const std::string &s) -> sol::table {
-            QByteArray bytes = QByteArray::fromStdString(s);
-            const auto fp = winols::computeChunkFingerprint(
-                QByteArrayView(bytes));
-            sol::table out = L.create_table();
-            out["chunkSize"] = winols::RomChunkFingerprint::CHUNK_SIZE;
-            out["fileSize"]  = double(fp.fileSize);
-            out["nChunks"]   = fp.chunks.size();
-            QByteArray flat;
-            flat.reserve(fp.chunks.size() * 16);
-            for (const auto &c : fp.chunks) {
-                char buf[17];
-                std::snprintf(buf, sizeof(buf), "%016llx",
-                              (unsigned long long)c.hash);
-                flat.append(buf, 16);
-            }
-            out["hashesHex"] = flat.toStdString();
-            return out;
-        });
-
-    L.set_function("_chunkContainment",
-        [](const std::string &n, const std::string &h) -> double {
-            const auto nf = winols::computeChunkFingerprint(
-                QByteArrayView(QByteArray::fromStdString(n)));
-            const auto hf = winols::computeChunkFingerprint(
-                QByteArrayView(QByteArray::fromStdString(h)));
-            return winols::chunkContainment(nf, hf);
         });
 
     // ── LEGION.9 ─────────────────────────────────────────────────────────

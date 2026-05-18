@@ -98,59 +98,6 @@ RomFingerprint hashOne(const QString &path)
     return fingerprint(QByteArrayView(fileData));
 }
 
-// Compute the CHUNK fingerprint for a file.  For multi-version .ols we
-// MERGE the chunk hashes of every version — same set / containment
-// semantics as the MinHash variant above.  A needle ROM that matches
-// ANY version of a stored file will surface; the find-similar query
-// can't tell which version, but it doesn't need to (the dialog will
-// show the user the path and they can open the right version).
-RomChunkFingerprint chunkOne(const QString &path)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return {};
-    constexpr qint64 kMaxRead = 64 * 1024 * 1024;
-    const QByteArray fileData = f.read(kMaxRead);
-    f.close();
-    if (fileData.size() < RomChunkFingerprint::CHUNK_SIZE) return {};
-
-    const QString ext = QFileInfo(path).suffix().toLower();
-    if (ext == QStringLiteral("ols") || ext == QStringLiteral("kp")) {
-        const ols::OlsImportResult res =
-            ols::OlsImporter::importFromBytes(fileData);
-        if (res.error.isEmpty() && !res.versions.isEmpty()) {
-            // Dedup by hash: a chunk seen in multiple versions only
-            // counts once in storage.  chunkIdx of the first occurrence
-            // is kept (debug-only; queries care about hash, not idx).
-            QHash<uint64_t, uint32_t> uniq;
-            qint64 maxSize = 0;
-            for (const auto &v : res.versions) {
-                if (v.romData.size() < RomChunkFingerprint::CHUNK_SIZE)
-                    continue;
-                const RomChunkFingerprint vfp =
-                    computeChunkFingerprint(QByteArrayView(v.romData));
-                for (const auto &c : vfp.chunks) {
-                    if (!uniq.contains(c.hash))
-                        uniq.insert(c.hash, c.chunkIdx);
-                }
-                if (v.romData.size() > maxSize) maxSize = v.romData.size();
-            }
-            if (!uniq.isEmpty()) {
-                RomChunkFingerprint out;
-                out.fileSize = maxSize;
-                out.chunks.reserve(uniq.size());
-                for (auto it = uniq.constBegin(); it != uniq.constEnd(); ++it) {
-                    ChunkHash ch;
-                    ch.chunkIdx = it.value();
-                    ch.hash     = it.key();
-                    out.chunks.append(ch);
-                }
-                return out;
-            }
-        }
-    }
-    return computeChunkFingerprint(QByteArrayView(fileData));
-}
-
 }  // namespace
 
 SimilarityIndex::SimilarityIndex(QObject *parent)
@@ -222,47 +169,6 @@ bool SimilarityIndex::createSchemaIfNeeded(QSqlDatabase &db, QString *err) const
     q.exec(QStringLiteral("PRAGMA synchronous=NORMAL"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_files_size "
                           "ON files(size)"));
-
-    // ── Chunk-fingerprint tables (CHUNK.2) ────────────────────────────────
-    //
-    // The original `files` table stores one MinHash blob per row — great
-    // for "code-pattern similar" lookups (Sprint I.7) but useless for the
-    // byte-twin discovery use-case (a 2 MB ROM differing in calibration
-    // produces near-identical MinHash but only ~13% byte overlap).
-    //
-    // The two tables below add a 16-KB-chunk BLAKE3-64 inverted index:
-    //
-    //   chunk_files(file_id, path, size, mtime, n_chunks)
-    //   chunk_hashes(file_id, chunk_idx, hash)
-    //   INDEX idx_chunk_hashes_hash ON (hash)   — fast inverted lookup
-    //   INDEX idx_chunk_hashes_file ON (file_id) — fast per-file delete
-    //
-    // Query side: for each needle chunk hash, SELECT file_id from
-    // chunk_hashes WHERE hash = ? ; aggregate count per file_id; rank by
-    // matched / total_needle_chunks (containment) — 1.0 means full
-    // byte-twin, 0.95+ means tuning-edit twins.
-    if (!q.exec(QStringLiteral(
-            "CREATE TABLE IF NOT EXISTS chunk_files ("
-            "  file_id   INTEGER PRIMARY KEY AUTOINCREMENT,"
-            "  path      TEXT UNIQUE NOT NULL,"
-            "  size      INTEGER,"
-            "  mtime     INTEGER,"
-            "  n_chunks  INTEGER)"))) {
-        if (err) *err = q.lastError().text();
-        return false;
-    }
-    if (!q.exec(QStringLiteral(
-            "CREATE TABLE IF NOT EXISTS chunk_hashes ("
-            "  file_id   INTEGER NOT NULL,"
-            "  chunk_idx INTEGER NOT NULL,"
-            "  hash      INTEGER NOT NULL)"))) {
-        if (err) *err = q.lastError().text();
-        return false;
-    }
-    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_chunk_hashes_hash "
-                          "ON chunk_hashes(hash)"));
-    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_chunk_hashes_file "
-                          "ON chunk_hashes(file_id)"));
     return true;
 }
 
@@ -439,9 +345,6 @@ void SimilarityIndex::rebuild(const QStringList &roots)
                     f.mtime = fi.lastModified().toSecsSinceEpoch();
                     f.fp    = hashOne(path);
                     f.bytesScanned = f.fp.bytesScanned;
-                    // CHUNK.3: byte-twin fingerprint, computed in the
-                    // same worker pass so we only read the file once.
-                    f.chunkFp = chunkOne(path);
                     return f;
                 });
 
@@ -452,13 +355,6 @@ void SimilarityIndex::rebuild(const QStringList &roots)
             if (!f.fp.isEmpty()) {
                 upsert(db, f);
                 ++batchInTx;
-            }
-            // CHUNK.3: persist the chunk fingerprint alongside MinHash.
-            // upsertChunkFingerprint manages its own transaction (delete
-            // old rows + insert new) so it's safe to call mid-batch.
-            if (!f.chunkFp.isEmpty()) {
-                upsertChunkFingerprintInner(db, f.path, f.size, f.mtime,
-                                            f.chunkFp);
             }
             ++processed;
             totalBytes += f.size;
@@ -555,151 +451,6 @@ IndexedFile SimilarityIndex::lookup(const QString &path) const
         f.fp    = RomFingerprint::fromBlob(q.value(4).toByteArray());
     }
     return f;
-}
-
-// ── CHUNK fingerprint persistence ───────────────────────────────────────────
-
-bool SimilarityIndex::upsertChunkFingerprintInner(
-        QSqlDatabase &db,
-        const QString &path, qint64 size, qint64 mtime,
-        const RomChunkFingerprint &fp) const
-{
-    // 1. Resolve / create file_id.
-    qint64 fileId = -1;
-    {
-        QSqlQuery q(db);
-        q.prepare(QStringLiteral("SELECT file_id FROM chunk_files WHERE path = ?"));
-        q.addBindValue(path);
-        if (q.exec() && q.next()) fileId = q.value(0).toLongLong();
-    }
-    if (fileId < 0) {
-        QSqlQuery q(db);
-        q.prepare(QStringLiteral(
-            "INSERT INTO chunk_files(path,size,mtime,n_chunks) VALUES(?,?,?,?)"));
-        q.addBindValue(path);
-        q.addBindValue(size);
-        q.addBindValue(mtime);
-        q.addBindValue(fp.chunks.size());
-        if (!q.exec()) return false;
-        fileId = q.lastInsertId().toLongLong();
-    } else {
-        QSqlQuery q(db);
-        q.prepare(QStringLiteral(
-            "UPDATE chunk_files SET size=?,mtime=?,n_chunks=? WHERE file_id=?"));
-        q.addBindValue(size);
-        q.addBindValue(mtime);
-        q.addBindValue(fp.chunks.size());
-        q.addBindValue(fileId);
-        if (!q.exec()) return false;
-
-        QSqlQuery del(db);
-        del.prepare(QStringLiteral("DELETE FROM chunk_hashes WHERE file_id=?"));
-        del.addBindValue(fileId);
-        del.exec();
-    }
-
-    // 2. Bulk-insert chunk hashes for this file.  Caller's transaction
-    // batches the writes — no per-row commit cost here.
-    QSqlQuery ins(db);
-    ins.prepare(QStringLiteral(
-        "INSERT INTO chunk_hashes(file_id,chunk_idx,hash) VALUES(?,?,?)"));
-    for (const auto &c : fp.chunks) {
-        ins.addBindValue(fileId);
-        ins.addBindValue(c.chunkIdx);
-        ins.addBindValue(qint64(c.hash));
-        if (!ins.exec()) return false;
-    }
-    return true;
-}
-
-bool SimilarityIndex::upsertChunkFingerprint(const QString &path,
-                                             qint64 size, qint64 mtime,
-                                             const RomChunkFingerprint &fp)
-{
-    if (!m_open) return false;
-    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
-    if (!db.isOpen()) return false;
-    db.transaction();
-    if (!upsertChunkFingerprintInner(db, path, size, mtime, fp)) {
-        db.rollback();
-        return false;
-    }
-    db.commit();
-    return true;
-}
-
-int SimilarityIndex::chunkFileCount() const
-{
-    if (!m_open) return 0;
-    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
-    if (!db.isOpen()) return 0;
-    QSqlQuery q(db);
-    if (!q.exec(QStringLiteral("SELECT COUNT(*) FROM chunk_files"))) return 0;
-    if (!q.next()) return 0;
-    return q.value(0).toInt();
-}
-
-QVector<ChunkMatch>
-SimilarityIndex::findByteSimilar(const RomChunkFingerprint &needle,
-                                 double minContainment,
-                                 int limit) const
-{
-    QVector<ChunkMatch> out;
-    if (!m_open || needle.chunks.isEmpty()) return out;
-    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
-    if (!db.isOpen()) return out;
-
-    // Build de-duplicated hash list — duplicate chunks within the same
-    // needle shouldn't count twice toward containment.
-    QHash<uint64_t, int> needleHashes;
-    needleHashes.reserve(needle.chunks.size());
-    for (const auto &c : needle.chunks) ++needleHashes[c.hash];
-    const int distinctHashes = needleHashes.size();
-    if (distinctHashes == 0) return out;
-
-    // Aggregate matched chunk count per file_id.  Stream needle hashes
-    // through prepared statement to keep memory bounded — SQLite IN()
-    // clauses cap at ~999 parameters, the per-hash loop dodges that.
-    QHash<qint64, int> matchedPerFile;
-    matchedPerFile.reserve(2048);
-    QSqlQuery q(db);
-    q.prepare(QStringLiteral(
-        "SELECT DISTINCT file_id FROM chunk_hashes WHERE hash = ?"));
-    for (auto it = needleHashes.constBegin();
-         it != needleHashes.constEnd(); ++it) {
-        q.bindValue(0, qint64(it.key()));
-        if (!q.exec()) continue;
-        while (q.next()) {
-            ++matchedPerFile[q.value(0).toLongLong()];
-        }
-    }
-
-    // Convert to ChunkMatch + filter by containment.
-    out.reserve(matchedPerFile.size());
-    QSqlQuery fq(db);
-    fq.prepare(QStringLiteral(
-        "SELECT path, size FROM chunk_files WHERE file_id = ?"));
-    for (auto it = matchedPerFile.constBegin();
-         it != matchedPerFile.constEnd(); ++it) {
-        const double contain = double(it.value()) / double(distinctHashes);
-        if (contain < minContainment) continue;
-        fq.bindValue(0, it.key());
-        if (!fq.exec() || !fq.next()) continue;
-        ChunkMatch m;
-        m.path           = fq.value(0).toString();
-        m.size           = fq.value(1).toLongLong();
-        m.needleChunks   = distinctHashes;
-        m.matchedChunks  = it.value();
-        m.containment    = contain;
-        out.append(std::move(m));
-    }
-
-    std::sort(out.begin(), out.end(),
-              [](const ChunkMatch &a, const ChunkMatch &b) {
-        return a.containment > b.containment;
-    });
-    if (out.size() > limit) out.resize(limit);
-    return out;
 }
 
 }  // namespace winols
