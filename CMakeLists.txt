@@ -185,7 +185,6 @@ set(SOURCES
     src/io/winols/WinOlsOpener.cpp
     src/io/winols/OlsCfgParser.cpp
     src/io/winols/RomFingerprint.cpp
-    src/io/winols/RomChunkFingerprint.cpp
     src/io/winols/SimilarityIndex.cpp
     src/io/winols/SimilarFilesDlg.cpp
     src/io/winols/BuildIndexProgressDlg.cpp
