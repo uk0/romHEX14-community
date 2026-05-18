@@ -123,8 +123,8 @@ void LuaEngine::initialize(MainWindow *mw)
         };
 
         if (os_tbl.valid()) {
-            os_tbl["execute"] = sol::nil;
-            os_tbl["exit"]    = sol::nil;
+            os_tbl["execute"] = sol::lua_nil;
+            os_tbl["exit"]    = sol::lua_nil;
             os_tbl["remove"] = [guardPath](const std::string &path) -> bool {
                 const QString safe = guardPath(path);
                 if (safe.isEmpty()) return false;
@@ -149,14 +149,14 @@ void LuaEngine::initialize(MainWindow *mw)
             };
         }
         if (io_tbl.valid()) {
-            io_tbl["popen"] = sol::nil;
+            io_tbl["popen"] = sol::lua_nil;
         }
         if (pkg_tbl.valid()) {
-            pkg_tbl["loadlib"] = sol::nil;
+            pkg_tbl["loadlib"] = sol::lua_nil;
         }
-        L["dofile"]   = sol::nil;
-        L["loadfile"] = sol::nil;
-        L["load"]     = sol::nil;
+        L["dofile"]   = sol::lua_nil;
+        L["loadfile"] = sol::lua_nil;
+        L["load"]     = sol::lua_nil;
     }
 
     // Redirect Lua's `print` to our captured-output buffer.
@@ -182,7 +182,7 @@ void LuaEngine::initialize(MainWindow *mw)
             appendOutput(QStringLiteral("[MessageBox] %1\n").arg(qtext));
             return 1;     // IDOK per Sprint L spec §6.5
         }
-        QMessageBox::information(nullptr, QStringLiteral("Lua"), qtext);
+        QMessageBox::information(nullptr, QObject::tr("Lua script"), qtext);
         return 1;
     });
 

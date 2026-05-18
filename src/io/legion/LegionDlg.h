@@ -3,21 +3,15 @@
  * Copyright (C) 2026 Cristian Tabuyo <contact@romhex14.com>
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * LegionDlg — UI shell for the LEGION crowd-tuned verdict pipeline.
+ * Catalog Tune Suggestions dialog — UI shell for the catalog-driven tune
+ * suggestion pipeline.
  *
  * Two-phase flow:
- *   Phase 1 (clusters): user sees auto-detected intent clusters (stage-like,
- *     dpf-like, mixed, …) discovered by Jaccard-clustering similar files
- *     from the SimilarityIndex.  User picks one or more clusters to feed in.
- *   Phase 2 (verdicts): per-cell aggregated deltas presented as tagged
- *     verdicts (Unanimous / StrongConsensus / Majority / Contested /
- *     Heretic).  Filtered by min-consensus slider, sortable, selectable.
- *
- * "We are many." — Mk 5:9.
- *
- * Scaffolding only at LEGION.5 — the actual voice harvest is synchronous
- * here; the worker thread + progress UI lands in LEGION.8.  The submit
- * workflow + undo are LEGION.7.  Per-verdict preview pane is LEGION.6.
+ *   Phase 1 (groups): scans the SimilarityIndex catalog for similar files,
+ *     auto-groups them by intent (Jaccard clustering over changed addresses).
+ *   Phase 2 (suggestions): per-cell aggregated deltas, tagged by agreement
+ *     (All agree / Strong / Majority / Disputed / Outlier).  Filterable by
+ *     min-consensus slider; user ticks which to apply.
  */
 
 #pragma once
@@ -35,7 +29,6 @@ class QSlider;
 class QProgressBar;
 class QStackedWidget;
 class QThread;
-class QTimer;
 class QTreeWidget;
 class QTreeWidgetItem;
 class Project;
@@ -104,11 +97,9 @@ private:
     QLabel         *m_lblStatus   = nullptr;
     LegionPreviewWidget *m_preview = nullptr;
 
-    // Worker thread (LEGION.8).
+    // Worker thread.
     QThread             *m_thread     = nullptr;
     LegionHarvestWorker *m_worker     = nullptr;
-    QTimer              *m_taglineTimer = nullptr;
-    int                  m_taglineIdx = 0;
 };
 
 }   // namespace legion

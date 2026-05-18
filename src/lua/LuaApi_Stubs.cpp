@@ -1022,14 +1022,14 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     // to the last map for backwards-compat callers without a selector arg.
     //
     // sel semantics (mirrors WinOLS manual):
-    //   sol::nil              → last map
+    //   sol::lua_nil              → last map
     //   bool true / number==1 → m_luaLastCreatedMap (else last)
     //   number==0             → last map (bLastNew=false)
     //   number>1              → find by start address (m.address == sel)
     //   string                → find by MapId (sideProp "IdName") or by name
     auto pickMap = [engine](Project *p, sol::object sel) -> MapInfo * {
         if (!p || p->maps.isEmpty()) return nullptr;
-        if (!sel.valid() || sel.is<sol::nil_t>())
+        if (!sel.valid() || sel.is<sol::lua_nil_t>())
             return &p->maps.last();
         if (sel.get_type() == sol::type::string) {
             const QString id = toQ(sel.as<std::string>());

@@ -2679,11 +2679,11 @@ void MainWindow::retranslateUi()
     m_menuFind->addSeparator();
     m_menuFind->addAction(tr("Find &Similar Files…"),
                           this, &MainWindow::actFindSimilarFiles);
-    m_menuFind->addAction(tr("Summon &LEGION…"), this, [this]() {
+    m_menuFind->addAction(tr("Catalog Tune &Suggestions…"), this, [this]() {
         Project *p = activeProject();
         if (!p || p->currentData.isEmpty()) {
             statusBar()->showMessage(
-                tr("Open a project first to summon the legion."), 4000);
+                tr("Open a project first to scan the catalog."), 4000);
             return;
         }
         auto *dlg = new legion::LegionDlg(p, this);
@@ -2700,7 +2700,7 @@ void MainWindow::retranslateUi()
             }
             if (hi < lo || hi >= uint32_t(p->currentData.size())) {
                 statusBar()->showMessage(
-                    tr("LEGION: nothing applicable in this ROM."), 4000);
+                    tr("No applicable catalog suggestions for this ROM."), 4000);
                 return;
             }
             const int spanLen = int(hi - lo + 1);
@@ -2740,7 +2740,7 @@ void MainWindow::retranslateUi()
             p->modified = true;
             emit p->dataChanged();
             statusBar()->showMessage(
-                tr("LEGION: %1 verdicts applied (%2 bytes changed). Ctrl+Z to undo.")
+                tr("Applied %1 catalog suggestions (%2 bytes changed). Ctrl+Z to undo.")
                 .arg(verdicts.size()).arg(totalChanged), 6000);
         });
         dlg->show();
