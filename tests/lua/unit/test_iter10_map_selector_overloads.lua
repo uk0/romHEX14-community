@@ -3,7 +3,7 @@ require("test_helper")
 
 -- Iter 10.7: window*MapProperties accept the third arg as a map selector:
 --   nil / 0      → last map in list
---   1 (or true)  → m_luaLastCreatedMap (the one projectAddMap returned)
+--   1 (or true)  → last map created by projectAddMap
 --   uint > 1     → find by start address
 --   string       → find by MapId / Name
 

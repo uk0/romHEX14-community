@@ -75,7 +75,9 @@ public:
     // calls don't trip the access-violation race documented at
     // finalizeClosedProject().  Returns true if a project was closed.
     bool     luaCloseActiveProject(bool deleteFile);
-    struct MapInfo *m_luaLastCreatedMap = nullptr;   // set by Lua's projectAddMap
+    void     luaRememberLastCreatedMap(Project *project, int mapIndex);
+    struct MapInfo *luaLastCreatedMap(Project *project) const;
+    void     luaClearLastCreatedMap(Project *project = nullptr);
 
 #ifdef RX14_DEBUG_RPC
     // ── Debug RPC entry points ────────────────────────────────────────────
@@ -343,6 +345,8 @@ private:
     // ── Projects / navigation state ───────────────────────────────────
     QVector<Project *> m_projects;
     int                m_currentMapIdx = -1; // index into activeProject->maps
+    QPointer<Project>  m_luaLastCreatedMapProject;
+    int                m_luaLastCreatedMapIndex = -1;
 
     // ── Font size ─────────────────────────────────────────────────────
     int        m_fontSize       = 10;

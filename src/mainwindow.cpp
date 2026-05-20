@@ -372,18 +372,15 @@ MainWindow::MainWindow(QWidget *parent)
     // Safe to call here: MDI exists, MainWindow itself is `this`.
     lua::LuaEngine::instance().initialize(this);
 
-    // P0-4/5: lock destructive UI while a Lua script is running.  The
-    // bindings hold raw Project* pointers across QEventLoop pumps
-    // (HttpExecute / Sleep / MessagePump) so a Close-Project click in the
-    // middle would dangle them.  Disabling the action is the smallest
-    // change that closes the race without rearchitecting threading.
+    // Lua scripts run on a worker thread; keep destructive project UI gated
+    // while one is active so user actions do not compete with scripted edits.
     connect(&lua::LuaEngine::instance(),
             &lua::LuaEngine::scriptRunningChanged,
             this, [this](bool running) {
         if (m_actClose) m_actClose->setEnabled(!running);
         if (running) {
             statusBar()->showMessage(
-                tr("Lua script running — close-project disabled until it returns."),
+                tr("Lua script running..."),
                 0);
         } else {
             statusBar()->clearMessage();
@@ -7539,6 +7536,7 @@ void MainWindow::finalizeClosedProject(Project *p)
 {
     if (!p) return;
     qCInfo(catFind) << "finalizeClosedProject:" << p->name;
+    luaClearLastCreatedMap(p);
     m_projects.removeAll(p);
     m_recentMaps.removeIf([p](const QPair<Project *, QString> &e) {
         return e.first == p;
@@ -9226,6 +9224,39 @@ bool MainWindow::luaCloseActiveProject(bool deleteFile)
     return true;
 }
 
+// ── Lua bridge helpers ──────────────────────────────────────────────────────
+
+void MainWindow::luaRememberLastCreatedMap(Project *project, int mapIndex)
+{
+    if (!project || mapIndex < 0 || mapIndex >= project->maps.size()) {
+        luaClearLastCreatedMap();
+        return;
+    }
+    m_luaLastCreatedMapProject = project;
+    m_luaLastCreatedMapIndex = mapIndex;
+}
+
+MapInfo *MainWindow::luaLastCreatedMap(Project *project) const
+{
+    if (!project || m_luaLastCreatedMapProject.isNull())
+        return nullptr;
+    if (m_luaLastCreatedMapProject.data() != project)
+        return nullptr;
+    if (m_luaLastCreatedMapIndex < 0 || m_luaLastCreatedMapIndex >= project->maps.size())
+        return nullptr;
+    return &project->maps[m_luaLastCreatedMapIndex];
+}
+
+void MainWindow::luaClearLastCreatedMap(Project *project)
+{
+    if (project && !m_luaLastCreatedMapProject.isNull()
+        && m_luaLastCreatedMapProject.data() != project) {
+        return;
+    }
+    m_luaLastCreatedMapProject.clear();
+    m_luaLastCreatedMapIndex = -1;
+}
+
 // ── Datalog menu wiring ─────────────────────────────────────────────────────
 
 #include "datalog/LogViewerWindow.h"
@@ -9289,6 +9320,11 @@ void MainWindow::rebuildDatalogMenu()
     // Sprint L — run an external Lua script through the embedded engine.
     m_menuDatalog->addSeparator();
     auto *luaAct = m_menuDatalog->addAction(tr("Run &Lua Script…"));
+    luaAct->setEnabled(!lua::LuaEngine::instance().isScriptRunning());
+    connect(&lua::LuaEngine::instance(),
+            &lua::LuaEngine::scriptRunningChanged,
+            luaAct,
+            [luaAct](bool running) { luaAct->setEnabled(!running); });
     connect(luaAct, &QAction::triggered, this, [this]() {
         QString path = QFileDialog::getOpenFileName(this,
             tr("Run Lua Script"), QString(),
@@ -9353,16 +9389,23 @@ void MainWindow::rebuildDatalogMenu()
             }
         }
 
-        QJsonObject r = lua::LuaEngine::instance().runFile(path);
-        if (!r.value(QStringLiteral("ok")).toBool()) {
-            QMessageBox::warning(this, tr("Lua error"),
-                                 r.value(QStringLiteral("error")).toString());
-        } else {
-            QString out = r.value(QStringLiteral("output")).toString();
-            if (!out.isEmpty()) {
-                QMessageBox::information(this, tr("Lua output"), out);
+        auto &engine = lua::LuaEngine::instance();
+        auto *conn = new QMetaObject::Connection;
+        *conn = connect(&engine, &lua::LuaEngine::scriptFinished, this,
+                        [this, conn](const QJsonObject &r) {
+            QObject::disconnect(*conn);
+            delete conn;
+            if (!r.value(QStringLiteral("ok")).toBool()) {
+                QMessageBox::warning(this, tr("Lua error"),
+                                     r.value(QStringLiteral("error")).toString());
+            } else {
+                QString out = r.value(QStringLiteral("output")).toString();
+                if (!out.isEmpty()) {
+                    QMessageBox::information(this, tr("Lua output"), out);
+                }
             }
-        }
+        });
+        engine.runFileAsync(path);
     });
 
     QStringList list = datalogRecent();

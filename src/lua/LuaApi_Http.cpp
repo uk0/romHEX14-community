@@ -92,7 +92,7 @@ QSet<QString> &sessionAllowedHosts()
     return s;
 }
 
-bool hostGate(const QString &host)
+bool hostGate(LuaEngine *engine, const QString &host)
 {
     if (host.isEmpty()) return false;
     if (isLoopback(host)) return true;
@@ -102,27 +102,33 @@ bool hostGate(const QString &host)
     const QString key = QStringLiteral("luaHttpAllowedHosts/") + host.toLower();
     if (settings.value(key, false).toBool()) return true;
 
-    QMessageBox dlg;
-    dlg.setIcon(QMessageBox::Warning);
-    dlg.setWindowTitle(QObject::tr("Lua script wants HTTP access"));
-    dlg.setText(QObject::tr("<b>Allow HTTP request to:</b><br><code>%1</code>?")
-                    .arg(host.toHtmlEscaped()));
-    dlg.setInformativeText(QObject::tr(
-        "The script can upload files (including project data) to this host. "
-        "Only allow hosts you trust."));
-    QAbstractButton *once = dlg.addButton(QObject::tr("Allow this time"),
-                                          QMessageBox::AcceptRole);
-    QAbstractButton *always = dlg.addButton(QObject::tr("Always allow this host"),
-                                            QMessageBox::AcceptRole);
-    dlg.addButton(QMessageBox::Cancel);
-    dlg.setDefaultButton(QMessageBox::Cancel);
-    dlg.exec();
-    QAbstractButton *clicked = dlg.clickedButton();
-    if (clicked == always) {
+    enum class Decision { Deny, Once, Always };
+    Decision decision = engine->callOnGui([&]() -> Decision {
+        QMessageBox dlg;
+        dlg.setIcon(QMessageBox::Warning);
+        dlg.setWindowTitle(QObject::tr("Lua script wants HTTP access"));
+        dlg.setText(QObject::tr("<b>Allow HTTP request to:</b><br><code>%1</code>?")
+                        .arg(host.toHtmlEscaped()));
+        dlg.setInformativeText(QObject::tr(
+            "The script can upload files (including project data) to this host. "
+            "Only allow hosts you trust."));
+        QAbstractButton *once = dlg.addButton(QObject::tr("Allow this time"),
+                                              QMessageBox::AcceptRole);
+        QAbstractButton *always = dlg.addButton(QObject::tr("Always allow this host"),
+                                                QMessageBox::AcceptRole);
+        dlg.addButton(QMessageBox::Cancel);
+        dlg.setDefaultButton(QMessageBox::Cancel);
+        dlg.exec();
+        QAbstractButton *clicked = dlg.clickedButton();
+        if (clicked == always) return Decision::Always;
+        if (clicked == once) return Decision::Once;
+        return Decision::Deny;
+    });
+    if (decision == Decision::Always) {
         settings.setValue(key, true);
         return true;
     }
-    if (clicked == once) {
+    if (decision == Decision::Once) {
         sessionAllowedHosts().insert(host.toLower());
         return true;
     }
@@ -134,13 +140,12 @@ bool hostGate(const QString &host)
 void bindHttpApi(sol::state &L, LuaEngine *engine)
 {
     auto &h = httpState();
-    (void)engine;
 
     // 2.2.8  HttpStart(url, verb="GET") → bool
-    L.set_function("HttpStart", [&h](const std::string &url, sol::optional<std::string> verb) -> bool {
+    L.set_function("HttpStart", [engine, &h](const std::string &url, sol::optional<std::string> verb) -> bool {
         const QString qurl = toQ(url);
         const QString host = QUrl(qurl).host();
-        if (!hostGate(host)) {
+        if (!hostGate(engine, host)) {
             h.url.clear();                              // block downstream calls
             h.lastError = QStringLiteral("HTTP host '%1' not allowed").arg(host);
             return false;

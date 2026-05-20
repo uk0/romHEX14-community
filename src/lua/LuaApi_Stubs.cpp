@@ -92,9 +92,10 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     // ── §5.2 export — Iter 9: Binary / IntelHex / S-record REAL;
     //    BdmToGo / WinOLS native / IntelKp / pluginowe → honest false ──
     L.set_function("projectExport", [engine](sol::variadic_args va) -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
         if (!p) { engine->setLastError("no project open"); return false; }
-        if (va.size() < 1) return false;
+        if (va.size() < 1) { engine->setLastError("projectExport: missing path argument"); return false; }
         QString path = toQ(va[0].as<std::string>());
         int type = va.size() >= 2 ? va[1].as<int>() : eFiletypeBinary;
         // eFiletypeAuto = pick by file extension.
@@ -128,10 +129,12 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         f.write(payload);
         f.close();
         return true;
+        });
     });
 
     // §5.2 projectExportMaps — REAL via existing MapListExporter
     L.set_function("projectExportMaps", [engine](const std::string &path) -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
         if (!p) { engine->setLastError("no project open"); return false; }
         QString qpath = toQ(path);
@@ -141,14 +144,16 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
                     : MapListExporter::toJson(*p, qpath, &err);
         if (!ok) engine->setLastError(err);
         return ok;
+        });
     });
 
     // §5.2 projectImport — Iter 9: Binary / IntelHex / S-record REAL via
     //                     parseROMData() (auto-detects from content).
     L.set_function("projectImport", [engine](sol::variadic_args va) -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
         if (!p) { engine->setLastError("no project open"); return false; }
-        if (va.size() < 1) return false;
+        if (va.size() < 1) { engine->setLastError("projectImport: missing path argument"); return false; }
         QString file = toQ(va[0].as<std::string>());
         int type = va.size() >= 2 ? va[1].as<int>() : eFiletypeAuto;
         // §5.7 — .winolsskript stub
@@ -208,6 +213,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         p->modified = true;
         emit p->dataChanged();
         return true;
+        });
     });
 
     // §5.2 projectImportFromOls(path, version=0, flags=0) — REAL via OlsImporter
@@ -215,9 +221,10 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     // Iter 9.6: honors eIFOls* flags from LuaConstants so callers can keep
     // parts of the active project intact (maps, data, byteOrder, baseAddress).
     L.set_function("projectImportFromOls", [engine](sol::variadic_args va) -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
         if (!p) { engine->setLastError("no project open"); return false; }
-        if (va.size() < 1) return false;
+        if (va.size() < 1) { engine->setLastError("projectImportFromOls: missing path argument"); return false; }
         QString path = toQ(va[0].as<std::string>());
         int version = va.size() >= 2 ? va[1].as<int>() : 0;
         int flags   = va.size() >= 3 ? va[2].as<int>() : 0;
@@ -239,12 +246,16 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         }
         int v = qBound(0, version, r.versions.size() - 1);
         if (!(flags & kSkipData))            p->currentData = r.versions[v].romData;
-        if (!(flags & kSkipMaps))            p->maps        = r.versions[v].maps;
+        if (!(flags & kSkipMaps)) {
+            p->maps = r.versions[v].maps;
+            engine->mainWindow()->luaClearLastCreatedMap(p);
+        }
         if (!(flags & kPreserveByteOrder))   p->byteOrder   = r.versions[v].byteOrder;
         if (!(flags & kPreserveBaseAddress)) p->baseAddress = r.versions[v].baseAddress;
         p->modified = true;
         emit p->dataChanged();
         return true;
+        });
     });
 
     L.set_function("projectImportCsvJson",  [engine](sol::variadic_args) -> bool {
@@ -253,9 +264,10 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
 
     // §5.2 projectImportMapPack — REAL via existing KpImporter
     L.set_function("projectImportMapPack", [engine](sol::variadic_args va) -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
         if (!p) { engine->setLastError("no project open"); return false; }
-        if (va.size() < 1) return false;
+        if (va.size() < 1) { engine->setLastError("projectImportMapPack: missing path argument"); return false; }
         QString path = toQ(va[0].as<std::string>());
         uint32_t baseAddr = va.size() >= 2 ? uint32_t(va[1].as<double>()) : p->baseAddress;
         QFile f(path);
@@ -273,6 +285,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         p->modified = true;
         emit p->dataChanged();
         return true;
+        });
     });
 
     // P0-7: honest false + GetLastError instead of silent failure.
@@ -354,8 +367,6 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
 
     L.set_function("projectFindBytes", [engine, &L, parsePattern, findMasked, packValue]
                    (sol::variadic_args va) -> sol::object {
-        Project *p = active(engine);
-        if (!p) { engine->setLastError("no project open"); return sol::make_object(L, -1); }
         if (va.size() < 3) return sol::make_object(L, -1);
         qint64 start = qint64(va[0].as<double>());
         // 4-arg overload: (start, end, orgVer, …)
@@ -372,7 +383,12 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
             orgVer = va[2].as<int>();
             firstByteArg = 3;
         }
-        const QByteArray &buf = orgVer ? p->currentData : p->originalData;
+        QByteArray buf = engine->callOnGui([&]() -> QByteArray {
+            Project *p = active(engine);
+            if (!p) { engine->setLastError("no project open"); return QByteArray(); }
+            return orgVer ? p->currentData : p->originalData;
+        });
+        if (buf.isEmpty()) return sol::make_object(L, -1);
 
         // Iter 10.6: peel a trailing datatype enum (eByte..eHiLoHiLo, 1..5).
         // We only treat the *last* arg as datatype when (a) all args after
@@ -431,8 +447,6 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     // `datatype` arg already, so Mode field acts as an explicit no-op here.
     L.set_function("projectReplaceBytes", [engine, parsePattern, findMasked, packValue]
                    (sol::variadic_args va) -> int {
-        Project *p = active(engine);
-        if (!p) { engine->setLastError("no project open"); return 0; }
         if (va.size() < 4) return 0;
         qint64 start = qint64(va[0].as<double>());
         qint64 end   = qint64(va[1].as<double>());
@@ -447,7 +461,6 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         // mode arg consumed but ignored (Mode=0 raw is the only wired mode).
         (void)(va.size() >= 8 ? va[7].as<int>() : 0);
 
-        const QByteArray &src = orgVer ? p->currentData : p->originalData;
         QByteArray needle, nmask, replBytes, rmask;
         if (searchIsStr) {
             parsePattern(searchStr, needle, nmask);
@@ -464,6 +477,10 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
             for (int k = 0; k < packed.size(); ++k) rmask.append(char(0xFF));
         }
         if (needle.isEmpty()) return 0;
+        return engine->callOnGui([&]() -> int {
+        Project *p = active(engine);
+        if (!p) { engine->setLastError("no project open"); return 0; }
+        const QByteArray &src = orgVer ? p->currentData : p->originalData;
         int count = 0;
         qint64 at = qMax<qint64>(0, start);
         while (count < limit) {
@@ -481,70 +498,90 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
             emit p->dataChanged();
         }
         return count;
+        });
     });
 
     // ── §5.2 maps — REAL ──
     L.set_function("projectFindMap", [engine, &L](sol::variadic_args va) -> sol::object {
-        Project *p = active(engine);
-        if (!p) { engine->setLastError("no project open"); return sol::make_object(L, -1); }
         if (va.size() < 2) return sol::make_object(L, -1);
         QString crit = toQ(va[0].as<std::string>());
         QString val  = toQ(va[1].as<std::string>());
         qint64 startAddr = va.size() >= 3 ? qint64(va[2].as<double>()) : 0;
         bool wantAll = (startAddr == -1);
-        sol::table arr = L.create_table();
-        int idx = 1;
-        for (const MapInfo &m : p->maps) {
-            QString candidate;
-            if (crit == QStringLiteral("Name"))   candidate = m.name;
-            else if (crit == QStringLiteral("IdName")) candidate = m.getSideProp("IdName").toString();
-            if (candidate != val) continue;
-            if (!wantAll) {
-                if (qint64(m.address) < startAddr) continue;
-                return sol::make_object(L, qint64(m.address));
+        QVector<qint64> hits = engine->callOnGui([&]() -> QVector<qint64> {
+            QVector<qint64> out;
+            Project *p = active(engine);
+            if (!p) { engine->setLastError("no project open"); return out; }
+            for (const MapInfo &m : p->maps) {
+                QString candidate;
+                if (crit == QStringLiteral("Name"))   candidate = m.name;
+                else if (crit == QStringLiteral("IdName")) candidate = m.getSideProp("IdName").toString();
+                if (candidate != val) continue;
+                if (!wantAll) {
+                    if (qint64(m.address) < startAddr) continue;
+                    out.push_back(qint64(m.address));
+                    return out;
+                }
+                out.push_back(qint64(m.address));
             }
-            arr[idx++] = qint64(m.address);
-        }
-        if (wantAll) return arr;
-        return sol::make_object(L, -1);
+            return out;
+        });
+        if (!wantAll)
+            return sol::make_object(L, hits.isEmpty() ? qint64(-1) : hits.first());
+        sol::table arr = L.create_table();
+        for (int i = 0; i < hits.size(); ++i)
+            arr[i + 1] = hits[i];
+        return arr;
     });
     L.set_function("projectAddMap", [engine]() -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
-        if (!p) return false;
+        if (!p) { engine->setLastError("no project open"); return false; }
         MapInfo m;
         m.name = QStringLiteral("LuaCreated");
         m.type = QStringLiteral("MAP");
+        const int newMapIndex = int(p->maps.size());
         p->maps.push_back(m);
-        engine->mainWindow()->m_luaLastCreatedMap = &p->maps.last();
+        engine->mainWindow()->luaRememberLastCreatedMap(p, newMapIndex);
         // Iter 10.4: mark project as modified + tell UI so Save Project /
         // diff overlays react to the new map.
         p->modified = true;
         emit p->dataChanged();
         return true;
+        });
     });
     L.set_function("projectDelMap", [engine](sol::object arg) -> int {
+        const bool isNum = arg.get_type() == sol::type::number;
+        const bool isStr = arg.get_type() == sol::type::string;
+        const uint32_t addr = isNum ? uint32_t(arg.as<double>()) : 0;
+        const QString pat = isStr ? toQ(arg.as<std::string>()) : QString();
+        return engine->callOnGui([&]() -> int {
         Project *p = active(engine);
         if (!p) return 0;
         int before = p->maps.size();
-        if (arg.get_type() == sol::type::number) {
-            uint32_t addr = uint32_t(arg.as<double>());
+        if (isNum) {
             auto it = std::remove_if(p->maps.begin(), p->maps.end(),
                 [addr](const MapInfo &m) { return m.address == addr; });
             p->maps.erase(it, p->maps.end());
-        } else if (arg.get_type() == sol::type::string) {
-            QString pat = toQ(arg.as<std::string>());
+        } else if (isStr) {
             QRegularExpression rx(QRegularExpression::wildcardToRegularExpression(pat));
             auto it = std::remove_if(p->maps.begin(), p->maps.end(),
                 [&rx](const MapInfo &m) { return rx.match(m.name).hasMatch(); });
             p->maps.erase(it, p->maps.end());
         }
         int removed = before - p->maps.size();
-        if (removed > 0) { p->modified = true; emit p->dataChanged(); }
+        if (removed > 0) {
+            engine->mainWindow()->luaClearLastCreatedMap(p);
+            p->modified = true;
+            emit p->dataChanged();
+        }
         return removed;
+        });
     });
     L.set_function("projectDelFolder", [engine](const std::string &name) -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
-        if (!p) return false;
+        if (!p) { engine->setLastError("no project open"); return false; }
         QString folder = toQ(name);
         int before = p->maps.size();
         auto it = std::remove_if(p->maps.begin(), p->maps.end(),
@@ -552,10 +589,16 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
                 return m.getSideProp("FolderName").toString() == folder;
             });
         p->maps.erase(it, p->maps.end());
-        if (p->maps.size() != before) { p->modified = true; emit p->dataChanged(); }
+        if (p->maps.size() != before) {
+            engine->mainWindow()->luaClearLastCreatedMap(p);
+            p->modified = true;
+            emit p->dataChanged();
+        }
         return true;
+        });
     });
     L.set_function("projectDelDuplicateMaps", [engine](bool byAddrOnly, bool sameFolder) -> int {
+        return engine->callOnGui([&]() -> int {
         Project *p = active(engine);
         if (!p) return -1;
         int before = p->maps.size();
@@ -578,8 +621,13 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         }
         p->maps = kept;
         int removed = before - p->maps.size();
-        if (removed > 0) { p->modified = true; emit p->dataChanged(); }
+        if (removed > 0) {
+            engine->mainWindow()->luaClearLastCreatedMap(p);
+            p->modified = true;
+            emit p->dataChanged();
+        }
         return removed;
+        });
     });
 
     // ── §5.2 similarity — REAL via winols::SimilarityIndex ──
@@ -598,11 +646,6 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     // open/close per match — adequate for tens of hits; can cache later).
     auto findSimilarImpl = [engine, &L](sol::variadic_args va) -> sol::table {
         sol::table arr = L.create_table();
-        Project *p = active(engine);
-        if (!p || p->originalData.isEmpty()) {
-            if (engine) engine->setLastError("no project or empty ROM");
-            return arr;
-        }
         if (va.size() < 2) return arr;
         int minPct = int(va[0].as<double>());
         int maxRes = int(va[1].as<double>());
@@ -625,8 +668,26 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         int relCols = trippleRelevance ? 3 : 1;
         int nCols   = relCols + propCols.size();
 
+        struct ActiveSnapshot {
+            QByteArray originalData;
+            QString filePath;
+        };
+        ActiveSnapshot activeSnapshot = engine->callOnGui([&]() -> ActiveSnapshot {
+            ActiveSnapshot snap;
+            Project *p = active(engine);
+            if (!p || p->originalData.isEmpty()) {
+                if (engine) engine->setLastError("no project or empty ROM");
+                return snap;
+            }
+            snap.originalData = p->originalData;
+            snap.filePath = p->filePath;
+            return snap;
+        });
+        if (activeSnapshot.originalData.isEmpty())
+            return arr;
+
         // Build fingerprint over our originalData and query the index.
-        winols::RomFingerprint needle = winols::fingerprint(p->originalData);
+        winols::RomFingerprint needle = winols::fingerprint(activeSnapshot.originalData);
         winols::SimilarityIndex idx;
         QString err;
         if (!idx.open(&err)) {
@@ -642,7 +703,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
 
         // Iter 10.8: exclude the active project's own .rx14proj from results
         // per manual.  Match by absolute path, case-insensitive on Windows.
-        const QString selfPath = p->filePath;
+        const QString selfPath = activeSnapshot.filePath;
         int writeIdx = 1;
         for (const auto &h : hits) {
             if (!selfPath.isEmpty()
@@ -716,6 +777,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     //
     // Returns 3 (full ok) on success, 0 on any failure.
     L.set_function("projectImportChanges", [engine](sol::variadic_args va) -> int {
+        return engine->callOnGui([&]() -> int {
         Project *p = active(engine);
         if (!p) { if (engine) engine->setLastError("no project open"); return 0; }
         if (va.size() < 2) return 0;
@@ -876,6 +938,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
             emit p->dataChanged();
         }
         return 3;   // full ok
+        });
     });
     // P0-7: honest false + GetLastError.
     L.set_function("projectAutoUpdate",    [engine](sol::variadic_args) -> bool {
@@ -889,6 +952,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
 
     // ── §5.2 vehicle data — REAL via EcuAutoDetect ──
     L.set_function("projectSearchVehicleData", [engine]() -> bool {
+        return engine->callOnGui([&]() -> bool {
         Project *p = active(engine);
         if (!p || p->originalData.isEmpty()) {
             if (engine) engine->setLastError("no project / empty ROM");
@@ -910,6 +974,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         ols::EcuAutoDetect::applyToFields(r, f, /*overwrite=*/false);
         p->modified = true;
         return true;
+        });
     });
     // P0-7: honest false + GetLastError.
     L.set_function("projectCloneVehicleData",  [engine](sol::variadic_args) -> bool {
@@ -928,6 +993,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     // eVerPropState (mapped from Project::projectType string), and
     // eVerPropCredits / eVerPropCVN (STUB-MISSING return "").
     L.set_function("versionGetProperty", [engine](int id) -> std::string {
+        return engine->callOnGui([&]() -> std::string {
         Project *p = active(engine);
         if (!p) return std::string();
         switch (id) {
@@ -960,13 +1026,17 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
             return std::string();  // STUB-MISSING — no romHEX14 backing field
         default: return std::string();
         }
+        });
     });
     L.set_function("versionSetProperty", [engine](int id, sol::object value) -> bool {
-        Project *p = active(engine);
-        if (!p) return false;
+        const bool valueIsNumber = value.get_type() == sol::type::number;
         QString s = (value.get_type() == sol::type::string)
                         ? toQ(value.as<std::string>())
                         : QString::number(value.as<double>());
+        const int numericValue = valueIsNumber ? value.as<int>() : s.toInt();
+        return engine->callOnGui([&]() -> bool {
+        Project *p = active(engine);
+        if (!p) { engine->setLastError("no project open"); return false; }
         switch (id) {
         case eVerPropName:    p->name = s; break;
         case eVerPropComment: p->notes = s; break;
@@ -974,7 +1044,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         case eVerPropTorque:  p->maxTorque = s.toInt(); break;
         case eVerPropState: {
             // Accept either int eVerStat* or string.  Reverse-map to projectType.
-            int v = (value.get_type() == sol::type::number) ? value.as<int>() : s.toInt();
+            int v = numericValue;
             switch (v) {
             case eVerStatMaster:     p->projectType = QStringLiteral("Master"); break;
             case eVerStatFinished:   p->projectType = QStringLiteral("Finished"); break;
@@ -987,14 +1057,19 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
             }
             break;
         }
-        default: return false;
+        default:
+            engine->setLastError(QStringLiteral(
+                "versionSetProperty: unsupported property id %1").arg(id));
+            return false;
         }
         p->modified = true;
         return true;
+        });
     });
 
     // ── §5.4 Window context — REAL via QMdiArea ──
     L.set_function("windowGetActive", [engine]() -> qint64 {
+        return engine->callOnGui([&]() -> qint64 {
         if (!engine || !engine->mainWindow()) return 0;
         // Walk subWindowList for a stable session-local index (1-based).
         // QMdiArea::activeSubWindow() returns the focused child.
@@ -1006,16 +1081,26 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         for (int i = 0; i < list.size(); ++i)
             if (list[i] == active) return qint64(i + 1);
         return 0;
+        });
     });
     L.set_function("windowSetActive", [engine](qint64 id) -> bool {
-        if (!engine || !engine->mainWindow()) return false;
+        return engine->callOnGui([&]() -> bool {
+        if (!engine || !engine->mainWindow()) {
+            if (engine) engine->setLastError("no main window");
+            return false;
+        }
         QMdiArea *mdi = engine->mainWindow()->findChild<QMdiArea *>();
-        if (!mdi) return false;
+        if (!mdi) { engine->setLastError("no MDI area"); return false; }
         const auto list = mdi->subWindowList();
         int idx = int(id) - 1;
-        if (idx < 0 || idx >= list.size()) return false;
+        if (idx < 0 || idx >= list.size()) {
+            engine->setLastError(QStringLiteral(
+                "windowSetActive: index %1 out of range").arg(id));
+            return false;
+        }
         mdi->setActiveSubWindow(list[idx]);
         return true;
+        });
     });
     // Iter 10.7: map selector helper used by both window*MapProperties
     // overloads.  Returns nullptr if no map matches; the caller falls back
@@ -1023,7 +1108,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     //
     // sel semantics (mirrors WinOLS manual):
     //   sol::lua_nil              → last map
-    //   bool true / number==1 → m_luaLastCreatedMap (else last)
+    //   bool true / number==1 → last map created by projectAddMap (else last)
     //   number==0             → last map (bLastNew=false)
     //   number>1              → find by start address (m.address == sel)
     //   string                → find by MapId (sideProp "IdName") or by name
@@ -1045,8 +1130,10 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
             const double dv = (sel.get_type() == sol::type::boolean)
                 ? (sel.as<bool>() ? 1.0 : 0.0) : sel.as<double>();
             const qint64 v = qint64(dv);
-            if (v == 1 && engine->mainWindow()->m_luaLastCreatedMap)
-                return engine->mainWindow()->m_luaLastCreatedMap;
+            if (v == 1) {
+                if (MapInfo *lastCreated = engine->mainWindow()->luaLastCreatedMap(p))
+                    return lastCreated;
+            }
             if (v == 0 || v == 1) return &p->maps.last();
             // v > 1 → treat as start address.
             const uint32_t addr = uint32_t(v);
@@ -1057,6 +1144,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
     };
 
     L.set_function("windowGetMapProperties", [engine, pickMap](sol::variadic_args va) -> std::string {
+        return engine->callOnGui([&]() -> std::string {
         if (va.size() < 1) return std::string();
         QString name = toQ(va[0].as<std::string>());
         Project *p = active(engine);
@@ -1084,9 +1172,15 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         if (name == QStringLiteral("FolderName")) return toS(m.getSideProp("FolderName").toString());
         QVariant v = m.getSideProp(name);
         return toS(v.toString());
+        });
     });
     L.set_function("windowSetMapProperties", [engine, pickMap](sol::variadic_args va) -> bool {
-        if (va.size() < 2) return false;
+        return engine->callOnGui([&]() -> bool {
+        if (va.size() < 2) {
+            if (engine) engine->setLastError(
+                "windowSetMapProperties: needs property name + value");
+            return false;
+        }
         QString name = toQ(va[0].as<std::string>());
         // Iter 10.7: third arg now goes through pickMap so script can target
         // a map by start address (number>1) or MapId (string), not just
@@ -1094,7 +1188,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         Project *p = active(engine);
         sol::object sel = va.size() >= 3 ? sol::object(va[2]) : sol::object();
         MapInfo *m = pickMap(p, sel);
-        if (!m) return false;
+        if (!m) { if (engine) engine->setLastError("map not found"); return false; }
         sol::object val = va[1];
         QString sv = (val.get_type() == sol::type::string)
                         ? toQ(val.as<std::string>())
@@ -1124,6 +1218,7 @@ void bindStubApi(sol::state &L, LuaEngine *engine)
         p->modified = true;
         emit p->dataChanged();
         return true;
+        });
     });
 
     // ── LEGION internal test bindings (M.1+) ──────────────────────────────

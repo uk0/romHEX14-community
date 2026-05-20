@@ -15,12 +15,22 @@
 #include <QObject>
 #include <QString>
 #include <QJsonObject>
+#include <QCoreApplication>
+#include <QMetaObject>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QThread>
+
+#include <optional>
+#include <type_traits>
+#include <utility>
 
 class MainWindow;
+class QThread;
 
 namespace lua {
 
-class LuaEngineImpl;   // sol::state pimpl — keeps sol/sol.hpp out of headers
+class LuaWorker;       // sol::state owner, lives on the Lua worker thread
 
 class LuaEngine : public QObject {
     Q_OBJECT
@@ -31,43 +41,84 @@ public:
     // injects §5.6 compat helpers (DoesFileExist, chomp, declare).
     void initialize(MainWindow *mw);
 
-    // Execute a .lua file.  Returns:
+    // Execute a .lua file synchronously. DebugRpc/tests use this path; GUI
+    // actions should use runFileAsync() so the main event loop is not nested.
     //   { "ok": true|false, "output": "<captured Log() text>", "error": "<msg>" }
     QJsonObject runFile(const QString &path);
+    void runFileAsync(const QString &path);
 
     // Execute an in-memory chunk (used internally to inject §5.6 helpers).
     bool runString(const QString &chunk, QString *err = nullptr);
 
     // The last error from any binding call.  Mirrors Lua's GetLastError().
-    QString getLastError() const { return m_lastError; }
-    void    setLastError(const QString &m) { m_lastError = m; }
+    QString getLastError() const {
+        QMutexLocker lock(&m_stateMutex);
+        return m_lastError;
+    }
+    void setLastError(const QString &m) {
+        QMutexLocker lock(&m_stateMutex);
+        m_lastError = m;
+    }
 
     // Drain accumulated Log() / print() output and reset buffer.
     QString takeOutput();
-    void    appendOutput(const QString &s) { m_output.append(s); }
+    void appendOutput(const QString &s) {
+        QMutexLocker lock(&m_stateMutex);
+        m_output.append(s);
+    }
 
     MainWindow *mainWindow() const { return m_mw; }
 
+    template <typename F>
+    auto callOnGui(F &&fn) -> std::invoke_result_t<F>
+    {
+        using Ret = std::invoke_result_t<F>;
+        QObject *target = QCoreApplication::instance();
+        if (!target || QThread::currentThread() == target->thread()) {
+            if constexpr (std::is_void_v<Ret>) {
+                std::forward<F>(fn)();
+                return;
+            } else {
+                return std::forward<F>(fn)();
+            }
+        }
+
+        if constexpr (std::is_void_v<Ret>) {
+            QMetaObject::invokeMethod(target, [&fn]() {
+                fn();
+            }, Qt::BlockingQueuedConnection);
+            return;
+        } else {
+            std::optional<Ret> result;
+            QMetaObject::invokeMethod(target, [&fn, &result]() {
+                result.emplace(fn());
+            }, Qt::BlockingQueuedConnection);
+            return std::move(*result);
+        }
+    }
+
     // ── P0-4/5 busy-state guard ─────────────────────────────────────────
     //
-    // Set to true while a script is executing (incl. inside Sleep /
-    // HttpExecute event-loop pumps).  MainWindow disables destructive
-    // actions (Close Project, Quit, tab close) while this is true so
-    // a re-entrant slot can't invalidate the raw Project* a binding is
-    // holding.  Read-only from C++; bindings call beginScript/endScript.
-    bool isScriptRunning() const { return m_scriptDepth > 0; }
+    // Set to true while a script is executing on the Lua worker. MainWindow
+    // uses this to gate UI actions that should not start overlapping scripts.
+    bool isScriptRunning() const;
     void beginScript();
     void endScript();
 
 signals:
     void scriptRunningChanged(bool running);
+    void scriptFinished(const QJsonObject &result);
 
 private:
     LuaEngine();
     ~LuaEngine() override;
 
-    LuaEngineImpl *m_impl = nullptr;   // sol::state holder
+    void clearRunState();
+
+    QThread      *m_workerThread = nullptr;
+    LuaWorker    *m_worker       = nullptr;
     MainWindow    *m_mw   = nullptr;
+    mutable QMutex m_stateMutex;
     QString        m_output;
     QString        m_lastError;
     int            m_scriptDepth = 0;   // P0-4/5: re-entrant runFile/runString

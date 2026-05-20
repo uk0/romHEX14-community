@@ -44,3 +44,15 @@ cmake_install.cmake
 install_manifest.txt
 build-installer/
 test-data/
+
+# Local diagnostic / scratch artefacts — never commit (may contain local
+# paths or workspace-specific data).
+diag_*.py
+diag_*.lua
+diag_resp.txt
+start_rebuild.lua
+windb.md
+windbout.md
+tescik*.jpg
+romhex14-community-*.zip
+wols_inspect/
