@@ -2719,7 +2719,19 @@ void MainWindow::retranslateUi()
             // STALE wave bytes.  HexWidget also needs an explicit refresh
             // so the new diff-vs-original highlights (m_modifications) get
             // recomputed.
-            ProjectView *pv = activeView();
+            // #4: the dialog is modeless, so the user may have switched to a
+            // different project's window since it opened.  Resolve the view
+            // that actually owns `p` instead of activeView(), or the refresh /
+            // undo / dataChanged would land on — and could clobber — the wrong
+            // project.  If p's view was closed meanwhile, pv stays null and we
+            // skip the view refresh (the data write to p->currentData already
+            // happened correctly).
+            ProjectView *pv = nullptr;
+            for (auto *sub : m_mdi->subWindowList()) {
+                if (auto *cand = qobject_cast<ProjectView *>(sub->widget())) {
+                    if (cand->project() == p) { pv = cand; break; }
+                }
+            }
             WaveformWidget *ww = pv ? pv->waveformWidget() : nullptr;
             WaveformEditor *ed = ww ? ww->editor() : nullptr;
 
@@ -3153,6 +3165,15 @@ QMdiSubWindow *MainWindow::openProject(Project *project)
     if (!m_projects.contains(project))
         m_projects.append(project);
 
+    // Make the QMdiArea page visible BEFORE adding+showing the subwindow.
+    // On the 0->1 transition the central stack is still on the placeholder
+    // page, so the QMdiArea is hidden and zero-sized; adding+show()ing a
+    // subwindow into it and only then flipping the stack triggers a resize
+    // storm on a freshly-shown subwindow that has crashed inside
+    // QMdiArea::resizeEvent.  Switching the page first gives the area a real
+    // geometry up front.
+    updateCentralPage();
+
     auto *view = new ProjectView();
     view->loadProject(project);
     __step("loadProject");
@@ -3171,10 +3192,13 @@ QMdiSubWindow *MainWindow::openProject(Project *project)
             this, &MainWindow::onStatusMessage);
     connect(view, &ProjectView::cloneVersionRequested,
             this, &MainWindow::onCloneVersionRequested);
-    connect(project, &Project::dataChanged, this, [this, sw, project]() {
-        sw->setWindowTitle(project->modified
-            ? project->fullTitle() + "  *"
-            : project->fullTitle());
+    QPointer<QMdiSubWindow> safeSw(sw);
+    QPointer<Project> safeProject(project);
+    connect(project, &Project::dataChanged, sw, [this, safeSw, safeProject]() {
+        if (!safeSw || !safeProject) return;
+        safeSw->setWindowTitle(safeProject->modified
+            ? safeProject->fullTitle() + "  *"
+            : safeProject->fullTitle());
         refreshProjectTree();
     });
 
@@ -3577,6 +3601,7 @@ void MainWindow::runMapAutoDetectOnImport(Project *project)
         m_scanStatusWidget->show();
     }
     QPointer<Project> projPtr(project);
+    Project *projectKey = project;
     QFuture<QVector<ols::MapCandidate>> fut = QtConcurrent::run(
         [rom, base]() {
             ols::MapAutoDetectOptions opts;
@@ -3585,14 +3610,14 @@ void MainWindow::runMapAutoDetectOnImport(Project *project)
     watcher->setFuture(fut);
     connect(watcher,
             &QFutureWatcher<QVector<ols::MapCandidate>>::finished,
-            this, [this, projPtr, watcher]() {
-        m_mapScanWatchers.remove(projPtr.data());
+            this, [this, projPtr, watcher, projectKey]() {
+        m_mapScanWatchers.remove(projectKey);
         // Hide the status-bar spinner once no scans remain.
         if (m_scanStatusWidget && m_mapScanWatchers.isEmpty())
             m_scanStatusWidget->hide();
         watcher->deleteLater();
         // Project gone (closed mid-scan) or A2L already arrived → discard.
-        if (!projPtr) return;
+        if (!projPtr || !m_projects.contains(projPtr.data())) return;
         if (!projPtr->maps.isEmpty()) return;
 
         const QVector<ols::MapCandidate> candidates = watcher->result();
@@ -6049,6 +6074,8 @@ void MainWindow::actGoHome()
     m_projects.clear();
     m_recentMaps.clear();
     m_translations.clear();
+    if (m_savepoints)
+        m_savepoints->attachTo(nullptr);
 
     refreshProjectTree();       // triggers updateCentralPage → welcome shows
     refreshRecentMapsStrip();
@@ -6099,7 +6126,11 @@ void MainWindow::actCloseProject()
             m_overlays.remove(k);
         }
     }
-    if (proj) proj->deleteLater();
+    if (proj) {
+        if (m_savepoints && m_savepoints->project() == proj)
+            m_savepoints->attachTo(nullptr);
+        proj->deleteLater();
+    }
     sw->close();
     m_translations.clear();
     refreshProjectTree();
@@ -6671,6 +6702,8 @@ void MainWindow::onSubWindowActivated(QMdiSubWindow *sw)
 #else
         setWindowTitle(QStringLiteral("romHEX 14 Community  \u2014  v") + qApp->applicationVersion());
 #endif
+        if (m_savepoints)
+            m_savepoints->attachTo(nullptr);
         return;
     }
     auto *pv = qobject_cast<ProjectView *>(sw->widget());
@@ -7536,7 +7569,10 @@ void MainWindow::finalizeClosedProject(Project *p)
 {
     if (!p) return;
     qCInfo(catFind) << "finalizeClosedProject:" << p->name;
+    cancelMapScan(p);
     luaClearLastCreatedMap(p);
+    if (m_savepoints && m_savepoints->project() == p)
+        m_savepoints->attachTo(nullptr);
     m_projects.removeAll(p);
     m_recentMaps.removeIf([p](const QPair<Project *, QString> &e) {
         return e.first == p;
@@ -7558,6 +7594,9 @@ void MainWindow::finalizeClosedProject(Project *p)
                 children.append(c);
         }
         for (Project *c : children) {
+            cancelMapScan(c);
+            if (m_savepoints && m_savepoints->project() == c)
+                m_savepoints->attachTo(nullptr);
             m_projects.removeAll(c);
             for (auto *csw : m_mdi->subWindowList()) {
                 auto *cpv = qobject_cast<ProjectView *>(csw->widget());
@@ -8131,8 +8170,17 @@ void MainWindow::actImportLinkedVersion()
     v.created = QDateTime::currentDateTime();
     v.data    = data;
     proj->versions.append(v);
+    const int newIdx = proj->versions.size() - 1;
     proj->modified = true;
     emit proj->versionsChanged();
+
+    // Also open the imported version as its own sibling project window, so it
+    // is a first-class, comparable entity — visible in the tree and usable in
+    // the Differences panel (which compares open projects, not in-project
+    // version snapshots).  This mirrors how a multi-version .ols opens each
+    // version in its own window.  The snapshot stays in the parent's Version
+    // dropdown for quick restore.
+    onCloneVersionRequested(proj, newIdx);
 
     statusBar()->showMessage(tr("Version '%1' imported from %2  (%3 bytes).")
         .arg(v.name).arg(QFileInfo(path).fileName()).arg(data.size()));

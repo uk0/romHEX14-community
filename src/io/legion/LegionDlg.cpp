@@ -71,6 +71,25 @@ QString kindName(VerdictKind k)
     return QStringLiteral("?");
 }
 
+// #7: the consensus column shows text like "9.9%"/"100.0%", which a plain
+// QTreeWidget sorts lexicographically ("9.9%" > "100.0%").  This item sorts
+// the consensus column numerically via a double stashed in Qt::UserRole;
+// every other column keeps the default text comparison.
+constexpr int kConsensusColumn = 7;
+class VerdictItem : public QTreeWidgetItem {
+public:
+    using QTreeWidgetItem::QTreeWidgetItem;
+    bool operator<(const QTreeWidgetItem &other) const override
+    {
+        const int col = treeWidget() ? treeWidget()->sortColumn() : 0;
+        if (col == kConsensusColumn) {
+            return data(col, Qt::UserRole).toDouble()
+                 < other.data(col, Qt::UserRole).toDouble();
+        }
+        return QTreeWidgetItem::operator<(other);
+    }
+};
+
 }   // anonymous
 
 // ─── ctor / dtor ────────────────────────────────────────────────────────────
@@ -81,8 +100,12 @@ LegionDlg::LegionDlg(Project *userProject, QWidget *parent)
     setWindowTitle(tr("Catalog Tune Suggestions"));
     setMinimumSize(900, 600);
     if (m_project) {
-        m_baseline = !m_project->originalData.isEmpty()
-                   ? m_project->originalData : m_project->currentData;
+        // #3: baseline must follow the version the user is actually looking
+        // at.  restoreVersion() writes only currentData, so scanning against
+        // originalData ignored the user's version choice.  Prefer
+        // currentData; fall back to originalData only if currentData is empty.
+        m_baseline = !m_project->currentData.isEmpty()
+                   ? m_project->currentData : m_project->originalData;
     }
     buildUi();
 }
@@ -245,6 +268,14 @@ void LegionDlg::buildUi()
     connect(m_btnSubmit, &QPushButton::clicked, this, &LegionDlg::onSubmit);
     connect(m_treeVerdict, &QTreeWidget::itemSelectionChanged,
             this, &LegionDlg::onVerdictRowChanged);
+    // #8: record manual check toggles so a later filter-rebuild can restore
+    // them.  Ignore changes we make ourselves during populateVerdicts().
+    connect(m_treeVerdict, &QTreeWidget::itemChanged, this,
+            [this](QTreeWidgetItem *it, int col) {
+        if (m_populating || col != 0) return;
+        const int idx = it->data(0, Qt::UserRole).toInt();
+        m_manualCheck[idx] = (it->checkState(0) == Qt::Checked);
+    });
     connect(p1Close, &QPushButton::clicked, this, &QDialog::reject);
     connect(p2Close, &QPushButton::clicked, this, &QDialog::reject);
 }
@@ -393,6 +424,7 @@ void LegionDlg::onClusterAdvance()
     const auto &cluster = m_clusters[ci];
     m_verdicts = aggregate(m_voices, m_baseline, cluster, kLocalSimMin);
     classify(m_verdicts, cluster.voiceIndices.size());
+    m_manualCheck.clear();   // #8: new cluster = fresh verdict set
 
     m_lblCluster->setText(tr("Group: %1 files · %2 · range 0x%3..0x%4")
         .arg(cluster.voiceIndices.size())
@@ -407,6 +439,7 @@ void LegionDlg::onClusterAdvance()
 
 void LegionDlg::populateVerdicts()
 {
+    m_populating = true;          // #8: suppress itemChanged while we rebuild
     m_treeVerdict->clear();
     m_preview->showVerdict(nullptr);
     if (m_activeClusterIdx < 0 || m_activeClusterIdx >= m_clusters.size())
@@ -423,13 +456,15 @@ void LegionDlg::populateVerdicts()
         const double coverage = totalVoices > 0
             ? double(v.maxSampleCount) / double(totalVoices) : 0.0;
 
-        auto *it = new QTreeWidgetItem(m_treeVerdict);
+        auto *it = new VerdictItem(m_treeVerdict);
         it->setFlags(it->flags() | Qt::ItemIsUserCheckable);
-        // Auto-tick anything stronger than Majority.
-        it->setCheckState(0,
-            (v.tag == VerdictTag::Unanimous ||
-             v.tag == VerdictTag::StrongConsensus)
-            ? Qt::Checked : Qt::Unchecked);
+        // Auto-tick anything stronger than Majority — unless the user has
+        // manually overridden this verdict (#8), in which case honour that.
+        const int verdictIdx = total - 1;
+        const bool autoTick = (v.tag == VerdictTag::Unanimous ||
+                               v.tag == VerdictTag::StrongConsensus);
+        const bool checked = m_manualCheck.value(verdictIdx, autoTick);
+        it->setCheckState(0, checked ? Qt::Checked : Qt::Unchecked);
         it->setText(1, tagName(v.tag));
         it->setText(2, QStringLiteral("0x%1").arg(v.startAddr, 0, 16));
         it->setText(3, QString::number(v.endAddr - v.startAddr + 1));
@@ -440,6 +475,7 @@ void LegionDlg::populateVerdicts()
         it->setText(6, QStringLiteral("%1/%2")
             .arg(v.maxSampleCount).arg(totalVoices));
         it->setText(7, QStringLiteral("%1%").arg(pct, 0, 'f', 1));
+        it->setData(7, Qt::UserRole, pct);   // #7: numeric sort key
 
         QColor c;
         switch (v.tag) {
@@ -460,6 +496,7 @@ void LegionDlg::populateVerdicts()
     m_treeVerdict->sortByColumn(7, Qt::DescendingOrder);
     m_lblStatus->setText(tr("%1 of %2 suggestions shown (≥%3%% consensus)")
                          .arg(kept).arg(total).arg(minPct));
+    m_populating = false;   // #8
 }
 
 void LegionDlg::onMinConsensusChanged(int v)

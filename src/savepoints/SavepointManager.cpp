@@ -18,6 +18,11 @@
 SavepointManager::SavepointManager(QObject *parent)
     : QObject(parent) {}
 
+Project *SavepointManager::project() const
+{
+    return m_project.data();
+}
+
 void SavepointManager::attachTo(Project *project)
 {
     if (m_project == project) return;

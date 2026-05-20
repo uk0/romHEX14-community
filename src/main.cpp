@@ -168,8 +168,17 @@ static void walkAndLogStack(EXCEPTION_POINTERS *ep, const char *origin)
                      (unsigned long)line.LineNumber);
         }
 
-        snprintf(buf, sizeof(buf), "  #%2d 0x%016llx %s!%s%s",
-                 i, (unsigned long long)addr, modBase, symName, lineInfo);
+        const DWORD64 rva = modBaseAddr ? addr - modBaseAddr : 0;
+        snprintf(buf, sizeof(buf),
+                 "  #%2d 0x%016llx %s+0x%llx (base 0x%016llx) %s!%s%s",
+                 i,
+                 (unsigned long long)addr,
+                 modBase,
+                 (unsigned long long)rva,
+                 (unsigned long long)modBaseAddr,
+                 modBase,
+                 symName,
+                 lineInfo);
         Logger::instance().writeCrashLine(buf);
     }
 

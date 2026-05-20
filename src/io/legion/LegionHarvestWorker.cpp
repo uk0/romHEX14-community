@@ -88,25 +88,50 @@ void LegionHarvestWorker::run()
         ols::OlsImportResult res;
         try { res = ols::OlsImporter::importFromBytes(bytes); }
         catch (...) { continue; }
+        // #6: a tune suggestion is a (Version 0 → Version i) diff, so a file
+        // needs at least two versions to contribute.  Raw .bin/.rom/.ori (one
+        // version, no embedded "original") can match in the index but have no
+        // author-made diff to harvest — skipping them here is intentional, not
+        // a silent failure.  We deliberately do NOT synthesise a
+        // baseline→file diff for them: that side would equal the user's
+        // baseline, so its local-similarity gate is always 100%, which would
+        // re-admit exactly the noisy off-target files this pass filters out.
         if (!res.error.isEmpty() || res.versions.size() < 2) continue;
 
+        // #1/#2: the file matched because the UNION of all its versions is
+        // similar to the needle — we don't know which one did.  Instead of
+        // blindly diffing first-vs-last, emit one voice per tuned version
+        // (Version 0 → Version i).  aggregate()'s per-voice local-similarity
+        // gate then keeps only the versions whose original matches the
+        // user's baseline, and versionIndex/Label lets the UI attribute
+        // each suggestion to a concrete version.
         const QByteArray &v0 = res.versions.first().romData;
-        const QByteArray &v1 = res.versions.last().romData;
-        if (v0.size() != v1.size() || v0.isEmpty()) continue;
+        if (v0.isEmpty()) continue;
 
-        LegionVoice voice;
-        voice.sourcePath = m.path;
-        voice.similarity = int(m.score.wholePct());
-        voice.regions    = detectRegions(v0, v1, 16);
-        for (const auto &r : voice.regions) {
-            for (uint32_t a = r.startAddr; a <= r.endAddr; ++a) {
-                if (a < uint32_t(v0.size()) && a < uint32_t(v1.size())
-                    && v0[int(a)] != v1[int(a)]) {
-                    voice.addressSet.insert(a);
+        const int nv = res.versions.size();
+        for (int vi = 1; vi < nv; ++vi) {
+            if (m_cancel.load()) break;
+            if (voices.size() >= m_maxVoices) break;
+
+            const QByteArray &vmod = res.versions[vi].romData;
+            if (vmod.size() != v0.size()) continue;
+
+            LegionVoice voice;
+            voice.sourcePath   = m.path;
+            voice.versionIndex = vi;
+            voice.versionLabel = res.versions[vi].name;
+            voice.similarity   = int(m.score.wholePct());
+            voice.regions      = detectRegions(v0, vmod, 16);
+            for (const auto &r : voice.regions) {
+                for (uint32_t a = r.startAddr; a <= r.endAddr; ++a) {
+                    if (a < uint32_t(v0.size()) && a < uint32_t(vmod.size())
+                        && v0[int(a)] != vmod[int(a)]) {
+                        voice.addressSet.insert(a);
+                    }
                 }
             }
+            if (!voice.addressSet.isEmpty()) voices.append(std::move(voice));
         }
-        if (!voice.addressSet.isEmpty()) voices.append(std::move(voice));
     }
 
     emit finished(voices, m_cancel.load());

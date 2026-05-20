@@ -36,8 +36,16 @@ struct LegionRegion {
 };
 
 // One source file's full contribution: its regions + lookup set.
+//
+// A voice is ONE (Version 0 → Version i) diff from a catalog .ols.  A
+// multi-version .ols (Original + Stage 1 + Stage 2 + …) emits one voice per
+// tuned version so the UI can attribute each suggestion to a concrete
+// version, and the per-voice local-similarity gate can keep only the
+// versions whose original actually matches the user's baseline (#1/#2).
 struct LegionVoice {
     QString               sourcePath;
+    int                   versionIndex = -1;   // .ols version this voice diffs (vs v0)
+    QString               versionLabel;        // human label, e.g. "Stage 1"
     int                   similarity = 0;   // overall % from SimilarityIndex
     QVector<LegionRegion> regions;
     QSet<uint32_t>        addressSet;       // every changed byte addr (for Jaccard)
