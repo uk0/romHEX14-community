@@ -20,6 +20,7 @@
 
 #include <QByteArray>
 #include <QDialog>
+#include <QHash>
 #include <QString>
 #include <QVector>
 
@@ -75,6 +76,13 @@ private:
     QVector<LegionVerdict> m_verdicts;
     QVector<LegionVerdict> m_selected;
     int                   m_activeClusterIdx = -1;
+
+    // #8: remember manual check overrides (verdict index → checked) so the
+    // consensus-filter slider, which rebuilds the verdict rows, does not
+    // discard the user's hand-picked selection.  m_populating suppresses the
+    // itemChanged signal while we set states programmatically.
+    QHash<int, bool>      m_manualCheck;
+    bool                  m_populating = false;
 
     // ── widgets ──
     QStackedWidget *m_stack       = nullptr;

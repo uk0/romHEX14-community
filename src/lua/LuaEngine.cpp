@@ -27,6 +27,11 @@
 #include <QMessageBox>
 #include <QApplication>
 #include <QDebug>
+#include <QEventLoop>
+#include <QMetaObject>
+#include <QThread>
+
+#include <memory>
 
 namespace lua {
 
@@ -43,8 +48,30 @@ public:
     sol::state L;
 };
 
+class LuaWorker : public QObject {
+public:
+    explicit LuaWorker(LuaEngine *engine) : m_engine(engine) {}
+
+    void initializeState();
+    QJsonObject runFile(const QString &path);
+    bool runString(const QString &chunk, QString *err);
+
+private:
+    LuaEngine *m_engine = nullptr;
+    std::unique_ptr<LuaEngineImpl> m_impl;
+};
+
 LuaEngine::LuaEngine() = default;
-LuaEngine::~LuaEngine() { delete m_impl; }
+LuaEngine::~LuaEngine()
+{
+    if (m_workerThread) {
+        m_workerThread->quit();
+        m_workerThread->wait();
+        delete m_workerThread;
+        m_workerThread = nullptr;
+        m_worker = nullptr;
+    }
+}
 
 LuaEngine &LuaEngine::instance()
 {
@@ -54,9 +81,25 @@ LuaEngine &LuaEngine::instance()
 
 void LuaEngine::initialize(MainWindow *mw)
 {
-    if (m_impl) return;            // already initialized
+    if (m_worker) return;          // already initialized
     m_mw = mw;
-    m_impl = new LuaEngineImpl;
+
+    m_workerThread = new QThread;
+    m_workerThread->setObjectName(QStringLiteral("LuaEngineWorker"));
+    m_worker = new LuaWorker(this);
+    m_worker->moveToThread(m_workerThread);
+    connect(m_workerThread, &QThread::finished, m_worker, &QObject::deleteLater);
+    m_workerThread->start();
+
+    QMetaObject::invokeMethod(m_worker, [this]() {
+        m_worker->initializeState();
+    }, Qt::BlockingQueuedConnection);
+}
+
+void LuaWorker::initializeState()
+{
+    if (m_impl) return;
+    m_impl = std::make_unique<LuaEngineImpl>();
     auto &L = m_impl->L;
 
     L.open_libraries(
@@ -169,7 +212,7 @@ void LuaEngine::initialize(MainWindow *mw)
                 .get<std::string>().c_str()));
         }
         s.append(QLatin1Char('\n'));
-        appendOutput(s);
+        m_engine->appendOutput(s);
         qDebug().noquote() << "[lua print]" << s.trimmed();
     });
 
@@ -179,30 +222,32 @@ void LuaEngine::initialize(MainWindow *mw)
         QString qtext = QString::fromUtf8(text.c_str());
         // Suppress modal dialog under test mode (RX14_LUA_TEST=1).
         if (qgetenv("RX14_LUA_TEST") == "1") {
-            appendOutput(QStringLiteral("[MessageBox] %1\n").arg(qtext));
+            m_engine->appendOutput(QStringLiteral("[MessageBox] %1\n").arg(qtext));
             return 1;     // IDOK per Sprint L spec §6.5
         }
-        QMessageBox::information(nullptr, QObject::tr("Lua script"), qtext);
+        m_engine->callOnGui([&]() {
+            QMessageBox::information(nullptr, QObject::tr("Lua script"), qtext);
+        });
         return 1;
     });
 
     L.set_function("Log", [this](const std::string &s) {
         QString q = QString::fromUtf8(s.c_str());
-        appendOutput(q + QLatin1Char('\n'));
+        m_engine->appendOutput(q + QLatin1Char('\n'));
         qDebug().noquote() << "[lua Log]" << q;
     });
 
     // Iter 2 — full §5.1 + §5.5
     bindConstants(L);
-    bindGlobalUtilities(L, this);
+    bindGlobalUtilities(L, m_engine);
     // Iter 3 — HTTP suite (8 funcs)
-    bindHttpApi(L, this);
+    bindHttpApi(L, m_engine);
     // Iter 4 — project context (real impls) + stubs (versions, maps, etc.)
-    bindProjectApi(L, this);
-    bindStubApi(L, this);
+    bindProjectApi(L, m_engine);
+    bindStubApi(L, m_engine);
 }
 
-QJsonObject LuaEngine::runFile(const QString &path)
+QJsonObject LuaWorker::runFile(const QString &path)
 {
     QJsonObject result;
     if (!m_impl) {
@@ -217,16 +262,12 @@ QJsonObject LuaEngine::runFile(const QString &path)
         return result;
     }
 
-    m_output.clear();
-    m_lastError.clear();
     auto &L = m_impl->L;
 
-    beginScript();
     sol::protected_function_result rc = L.safe_script_file(
         path.toStdString(), sol::script_pass_on_error);
-    endScript();
 
-    QString output = takeOutput();
+    QString output = m_engine->takeOutput();
     if (!rc.valid()) {
         sol::error err = rc;
         QString errStr = QString::fromUtf8(err.what());
@@ -241,16 +282,14 @@ QJsonObject LuaEngine::runFile(const QString &path)
     return result;
 }
 
-bool LuaEngine::runString(const QString &chunk, QString *err)
+bool LuaWorker::runString(const QString &chunk, QString *err)
 {
     if (!m_impl) {
         if (err) *err = QStringLiteral("LuaEngine not initialized");
         return false;
     }
-    beginScript();
     sol::protected_function_result rc =
         m_impl->L.safe_script(chunk.toStdString(), sol::script_pass_on_error);
-    endScript();
     if (!rc.valid()) {
         sol::error e = rc;
         if (err) *err = QString::fromUtf8(e.what());
@@ -259,19 +298,175 @@ bool LuaEngine::runString(const QString &chunk, QString *err)
     return true;
 }
 
+QJsonObject LuaEngine::runFile(const QString &path)
+{
+    QJsonObject result;
+    if (!m_worker) {
+        result.insert("ok", false);
+        result.insert("error", QStringLiteral("LuaEngine not initialized"));
+        return result;
+    }
+    if (isScriptRunning()) {
+        result.insert("ok", false);
+        result.insert("error", QStringLiteral("Lua script already running"));
+        return result;
+    }
+    QFileInfo fi(path);
+    if (!fi.exists() || !fi.isFile()) {
+        result.insert("ok", false);
+        result.insert("error", QStringLiteral("file not found: %1").arg(path));
+        return result;
+    }
+
+    clearRunState();
+    beginScript();
+
+    QObject *app = QCoreApplication::instance();
+    if (QThread::currentThread() == m_workerThread) {
+        result = m_worker->runFile(path);
+    } else if (app && QThread::currentThread() == app->thread()) {
+        QEventLoop loop;
+        QMetaObject::invokeMethod(m_worker, [this, path, &result, &loop]() {
+            result = m_worker->runFile(path);
+            QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+        }, Qt::QueuedConnection);
+        loop.exec();
+    } else {
+        QMetaObject::invokeMethod(m_worker, [this, path, &result]() {
+            result = m_worker->runFile(path);
+        }, Qt::BlockingQueuedConnection);
+    }
+
+    endScript();
+    return result;
+}
+
+void LuaEngine::runFileAsync(const QString &path)
+{
+    auto finishError = [this](const QString &message) {
+        QJsonObject result;
+        result.insert("ok", false);
+        result.insert("error", message);
+        emit scriptFinished(result);
+    };
+
+    if (!m_worker) {
+        finishError(QStringLiteral("LuaEngine not initialized"));
+        return;
+    }
+    if (isScriptRunning()) {
+        finishError(QStringLiteral("Lua script already running"));
+        return;
+    }
+    QFileInfo fi(path);
+    if (!fi.exists() || !fi.isFile()) {
+        finishError(QStringLiteral("file not found: %1").arg(path));
+        return;
+    }
+
+    clearRunState();
+    beginScript();
+
+    const bool queued = QMetaObject::invokeMethod(m_worker, [this, path]() {
+        QJsonObject result = m_worker->runFile(path);
+        QMetaObject::invokeMethod(this, [this, result]() {
+            endScript();
+            emit scriptFinished(result);
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+
+    if (!queued) {
+        endScript();
+        finishError(QStringLiteral("failed to queue Lua script"));
+    }
+}
+
+bool LuaEngine::runString(const QString &chunk, QString *err)
+{
+    if (!m_worker) {
+        if (err) *err = QStringLiteral("LuaEngine not initialized");
+        return false;
+    }
+    if (isScriptRunning()) {
+        if (err) *err = QStringLiteral("Lua script already running");
+        return false;
+    }
+
+    bool ok = false;
+    QString workerErr;
+    beginScript();
+
+    QObject *app = QCoreApplication::instance();
+    if (QThread::currentThread() == m_workerThread) {
+        ok = m_worker->runString(chunk, &workerErr);
+    } else if (app && QThread::currentThread() == app->thread()) {
+        QEventLoop loop;
+        QMetaObject::invokeMethod(m_worker, [this, chunk, &ok, &workerErr, &loop]() {
+            ok = m_worker->runString(chunk, &workerErr);
+            QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection);
+        }, Qt::QueuedConnection);
+        loop.exec();
+    } else {
+        QMetaObject::invokeMethod(m_worker, [this, chunk, &ok, &workerErr]() {
+            ok = m_worker->runString(chunk, &workerErr);
+        }, Qt::BlockingQueuedConnection);
+    }
+
+    endScript();
+    if (!ok && err) *err = workerErr;
+    return ok;
+}
+
+bool LuaEngine::isScriptRunning() const
+{
+    bool running = false;
+    auto check = [this, &running]() {
+        running = m_scriptDepth > 0;
+    };
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(const_cast<LuaEngine *>(this), check,
+                                  Qt::BlockingQueuedConnection);
+        return running;
+    }
+    check();
+    return running;
+}
+
 void LuaEngine::beginScript()
 {
-    if (++m_scriptDepth == 1) emit scriptRunningChanged(true);
+    auto bump = [this]() {
+        if (++m_scriptDepth == 1) emit scriptRunningChanged(true);
+    };
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, bump, Qt::BlockingQueuedConnection);
+        return;
+    }
+    bump();
 }
 
 void LuaEngine::endScript()
 {
-    if (m_scriptDepth > 0 && --m_scriptDepth == 0)
-        emit scriptRunningChanged(false);
+    auto drop = [this]() {
+        if (m_scriptDepth > 0 && --m_scriptDepth == 0)
+            emit scriptRunningChanged(false);
+    };
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, drop, Qt::BlockingQueuedConnection);
+        return;
+    }
+    drop();
+}
+
+void LuaEngine::clearRunState()
+{
+    QMutexLocker lock(&m_stateMutex);
+    m_output.clear();
+    m_lastError.clear();
 }
 
 QString LuaEngine::takeOutput()
 {
+    QMutexLocker lock(&m_stateMutex);
     QString o = m_output;
     m_output.clear();
     return o;

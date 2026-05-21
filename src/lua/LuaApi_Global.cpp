@@ -154,81 +154,100 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
     // array of the entered values (empty array on Cancel).
     L.set_function("TextEntryDialog", sol::overload(
         // Signature 1: old single-field form
-        [](int mode, const std::string &title, const std::string &desc,
+        [engine](int mode, const std::string &title, const std::string &desc,
            sol::optional<std::string> def) -> std::string {
             QString d = def ? toQ(*def) : QString();
-            QInputDialog dlg;
-            dlg.setWindowTitle(toQ(title));
-            dlg.setLabelText(toQ(desc));
-            dlg.setTextValue(d);
-            if (mode == 1 /* eTextEntryPassword */)
-                dlg.setTextEchoMode(QLineEdit::Password);
             // Under test mode: skip the dialog, just return default value.
             if (qgetenv("RX14_LUA_TEST") == "1") return toS(d);
-            if (dlg.exec() != QDialog::Accepted) return std::string();
-            return toS(dlg.textValue());
+            QString result = engine->callOnGui([&]() -> QString {
+                QInputDialog dlg;
+                dlg.setWindowTitle(toQ(title));
+                dlg.setLabelText(toQ(desc));
+                dlg.setTextValue(d);
+                if (mode == 1 /* eTextEntryPassword */)
+                    dlg.setTextEchoMode(QLineEdit::Password);
+                if (dlg.exec() != QDialog::Accepted) return QString();
+                return dlg.textValue();
+            });
+            return toS(result);
         },
         // Signature 2: new multi-field form (Iter 7 full implementation)
-        [&L](const std::string &title, sol::variadic_args va) -> sol::table {
+        [engine, &L](const std::string &title, sol::variadic_args va) -> sol::table {
             sol::table arr = L.create_table();
             // Triplets: (mode, desc, default).  Stop at non-triplet boundary.
             const int nTrips = int(va.size()) / 3;
             if (nTrips == 0) return arr;
 
+            struct Field {
+                int mode = 0;
+                QString desc;
+                QString def;
+            };
+            QVector<Field> fields;
+            fields.reserve(nTrips);
+            for (int i = 0; i < nTrips; ++i) {
+                fields.push_back({
+                    va[i * 3 + 0].as<int>(),
+                    toQ(va[i * 3 + 1].as<std::string>()),
+                    toQ(va[i * 3 + 2].as<std::string>())
+                });
+            }
+
             // Test mode: skip the modal dialog, return all defaults.
             if (qgetenv("RX14_LUA_TEST") == "1") {
-                for (int i = 0; i < nTrips; ++i) {
-                    QString def = toQ(va[i * 3 + 2].as<std::string>());
-                    arr[i + 1] = toS(def);
-                }
+                for (int i = 0; i < fields.size(); ++i)
+                    arr[i + 1] = toS(fields[i].def);
                 return arr;
             }
 
-            QDialog dlg;
-            dlg.setWindowTitle(toQ(title));
-            auto *form = new QFormLayout(&dlg);
+            QVector<QString> values = engine->callOnGui([&]() -> QVector<QString> {
+                QVector<QString> out;
+                QDialog dlg;
+                dlg.setWindowTitle(toQ(title));
+                auto *form = new QFormLayout(&dlg);
 
-            QVector<QLineEdit *> lineEdits;
-            QVector<QCheckBox *> checkboxes;
-            QVector<int>         modes;
+                QVector<QLineEdit *> lineEdits;
+                QVector<QCheckBox *> checkboxes;
 
-            int textCount = 0, checkCount = 0;
-            for (int i = 0; i < nTrips; ++i) {
-                int     mode = va[i * 3 + 0].as<int>();
-                QString desc = toQ(va[i * 3 + 1].as<std::string>());
-                QString def  = toQ(va[i * 3 + 2].as<std::string>());
-                modes.push_back(mode);
-                if (mode == 3 /* eTextEntryCheckbox */) {
-                    if (++checkCount > 20) break;   // manual cap
-                    auto *cb = new QCheckBox(desc, &dlg);
-                    cb->setChecked(def == QStringLiteral("1") || def.toLower() == QStringLiteral("true"));
-                    form->addRow(cb);
-                    checkboxes.push_back(cb);
-                    lineEdits.push_back(nullptr);
-                } else {
-                    if (++textCount > 10) break;    // manual cap
-                    auto *le = new QLineEdit(def, &dlg);
-                    if (mode == 1 /* eTextEntryPassword */)
-                        le->setEchoMode(QLineEdit::Password);
-                    form->addRow(desc, le);
-                    lineEdits.push_back(le);
-                    checkboxes.push_back(nullptr);
+                int textCount = 0, checkCount = 0;
+                for (const Field &field : fields) {
+                    if (field.mode == 3 /* eTextEntryCheckbox */) {
+                        if (++checkCount > 20) break;   // manual cap
+                        auto *cb = new QCheckBox(field.desc, &dlg);
+                        cb->setChecked(field.def == QStringLiteral("1") ||
+                                       field.def.toLower() == QStringLiteral("true"));
+                        form->addRow(cb);
+                        checkboxes.push_back(cb);
+                        lineEdits.push_back(nullptr);
+                    } else {
+                        if (++textCount > 10) break;    // manual cap
+                        auto *le = new QLineEdit(field.def, &dlg);
+                        if (field.mode == 1 /* eTextEntryPassword */)
+                            le->setEchoMode(QLineEdit::Password);
+                        form->addRow(field.desc, le);
+                        lineEdits.push_back(le);
+                        checkboxes.push_back(nullptr);
+                    }
                 }
-            }
 
-            auto *buttons = new QDialogButtonBox(
-                QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-            QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
-            QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-            form->addRow(buttons);
+                auto *buttons = new QDialogButtonBox(
+                    QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+                QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+                QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+                form->addRow(buttons);
 
-            if (dlg.exec() != QDialog::Accepted) return arr;   // empty on cancel
-            for (int i = 0; i < lineEdits.size(); ++i) {
-                if (lineEdits[i])
-                    arr[i + 1] = toS(lineEdits[i]->text());
-                else if (checkboxes[i])
-                    arr[i + 1] = std::string(checkboxes[i]->isChecked() ? "1" : "0");
-            }
+                if (dlg.exec() != QDialog::Accepted) return out;
+                for (int i = 0; i < lineEdits.size(); ++i) {
+                    if (lineEdits[i])
+                        out.push_back(lineEdits[i]->text());
+                    else if (checkboxes[i])
+                        out.push_back(checkboxes[i]->isChecked()
+                                      ? QStringLiteral("1") : QStringLiteral("0"));
+                }
+                return out;
+            });
+            for (int i = 0; i < values.size(); ++i)
+                arr[i + 1] = toS(values[i]);
             return arr;
         }
     ));
@@ -242,26 +261,28 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
             engine->appendOutput(QStringLiteral("[MessageBox] %1\n").arg(q));
             return 1; // IDOK
         }
-        // Iter 10.1: icon constants per WinAPI MB_ICON*.  Order matters
-        // because the bits overlap: MB_ICONWARNING=0x30 contains 0x10 + 0x20.
-        // Check the wider mask before the narrower one.
-        QMessageBox::Icon icon = QMessageBox::NoIcon;
-        const int iconBits = t & 0xF0;
-        if      (iconBits == 0x10) icon = QMessageBox::Critical;       // MB_ICONERROR
-        else if (iconBits == 0x20) icon = QMessageBox::Question;       // MB_ICONQUESTION
-        else if (iconBits == 0x30) icon = QMessageBox::Warning;        // MB_ICONWARNING
-        else if (iconBits == 0x40) icon = QMessageBox::Information;    // MB_ICONINFORMATION
-        QMessageBox box(icon, QObject::tr("Lua script"), q);
-        // Button set (low nibble)
-        switch (t & 0xF) {
-        case 1: box.setStandardButtons(QMessageBox::Ok | QMessageBox::Cancel); break;
-        case 2: box.setStandardButtons(QMessageBox::Abort | QMessageBox::Retry | QMessageBox::Ignore); break;
-        case 3: box.setStandardButtons(QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel); break;
-        case 4: box.setStandardButtons(QMessageBox::Yes | QMessageBox::No); break;
-        case 5: box.setStandardButtons(QMessageBox::Retry | QMessageBox::Cancel); break;
-        default: box.setStandardButtons(QMessageBox::Ok); break;
-        }
-        int rc = box.exec();
+        int rc = engine->callOnGui([&]() -> int {
+            // Iter 10.1: icon constants per WinAPI MB_ICON*.  Order matters
+            // because the bits overlap: MB_ICONWARNING=0x30 contains 0x10 + 0x20.
+            // Check the wider mask before the narrower one.
+            QMessageBox::Icon icon = QMessageBox::NoIcon;
+            const int iconBits = t & 0xF0;
+            if      (iconBits == 0x10) icon = QMessageBox::Critical;       // MB_ICONERROR
+            else if (iconBits == 0x20) icon = QMessageBox::Question;       // MB_ICONQUESTION
+            else if (iconBits == 0x30) icon = QMessageBox::Warning;        // MB_ICONWARNING
+            else if (iconBits == 0x40) icon = QMessageBox::Information;    // MB_ICONINFORMATION
+            QMessageBox box(icon, QObject::tr("Lua script"), q);
+            // Button set (low nibble)
+            switch (t & 0xF) {
+            case 1: box.setStandardButtons(QMessageBox::Ok | QMessageBox::Cancel); break;
+            case 2: box.setStandardButtons(QMessageBox::Abort | QMessageBox::Retry | QMessageBox::Ignore); break;
+            case 3: box.setStandardButtons(QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel); break;
+            case 4: box.setStandardButtons(QMessageBox::Yes | QMessageBox::No); break;
+            case 5: box.setStandardButtons(QMessageBox::Retry | QMessageBox::Cancel); break;
+            default: box.setStandardButtons(QMessageBox::Ok); break;
+            }
+            return box.exec();
+        });
         switch (rc) {
         case QMessageBox::Ok:     return 1;
         case QMessageBox::Cancel: return 2;
@@ -337,19 +358,25 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
     });
 
     // 2.2.20  Quit
-    L.set_function("Quit", []() {
-        if (qApp) qApp->quit();
+    L.set_function("Quit", [engine]() {
+        engine->callOnGui([]() {
+            if (qApp) qApp->quit();
+        });
     });
 
     // 2.2.21  SaveAll — Iter 7: iterate every open Project and call save()
     L.set_function("SaveAll", [engine]() {
-        if (engine && engine->mainWindow())
-            engine->mainWindow()->luaSaveAllProjects();
+        engine->callOnGui([&]() {
+            if (engine && engine->mainWindow())
+                engine->mainWindow()->luaSaveAllProjects();
+        });
     });
     // 2.2.22  CloseAll — Iter 7: close every MDI sub-window
     L.set_function("CloseAll", [engine]() {
-        if (engine && engine->mainWindow())
-            engine->mainWindow()->luaCloseAllProjects();
+        engine->callOnGui([&]() {
+            if (engine && engine->mainWindow())
+                engine->mainWindow()->luaCloseAllProjects();
+        });
     });
 
     // 2.2.23 / 2.2.24  SetClient / GetClient
@@ -381,8 +408,10 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
     // MainWindow so subsequent projectImport(path) actually populates it.
     // Required by portal_find_options.lua / portal_apply_selection.lua.
     L.set_function("NewProject", [engine]() {
-        if (!engine || !engine->mainWindow()) return;
-        engine->mainWindow()->luaNewProject();
+        engine->callOnGui([&]() {
+            if (!engine || !engine->mainWindow()) return;
+            engine->mainWindow()->luaNewProject();
+        });
     });
 
     // 2.2.26  GetVersion
@@ -414,7 +443,6 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
                 QDir d(dir);
                 if (!d.entryList({pat}, QDir::Files).isEmpty()) return;
             }
-            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
             QThread::msleep(10);
         }
     });
@@ -534,16 +562,18 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
             setLastErr(QStringLiteral("version %1 has no data").arg(versionIdx));
             return false;
         }
-        Project *active = engine ? engine->mainWindow()->luaActiveProject() : nullptr;
-        if (!active) {
-            setLastErr(QStringLiteral("no active project to receive version data"));
-            return false;
-        }
-        active->currentData = chosen;
-        if (active->originalData.isEmpty()) active->originalData = chosen;
-        active->modified = true;
-        emit active->dataChanged();
-        return true;
+        return engine->callOnGui([&]() -> bool {
+            Project *active = engine ? engine->mainWindow()->luaActiveProject() : nullptr;
+            if (!active) {
+                setLastErr(QStringLiteral("no active project to receive version data"));
+                return false;
+            }
+            active->currentData = chosen;
+            if (active->originalData.isEmpty()) active->originalData = chosen;
+            active->modified = true;
+            emit active->dataChanged();
+            return true;
+        });
     });
 
     // 2.2.33  DeleteProjectVersion(filename, versionIdx) → bool
@@ -585,8 +615,11 @@ void bindGlobalUtilities(sol::state &L, LuaEngine *engine)
     L.set_function("ReactivateChecksums", []() { /* no-op */ });
 
     // 2.2.36  StartUrl
-    L.set_function("StartUrl", [](const std::string &url) {
-        QDesktopServices::openUrl(QUrl(toQ(url)));
+    L.set_function("StartUrl", [engine](const std::string &url) {
+        const QString qurl = toQ(url);
+        engine->callOnGui([&]() {
+            QDesktopServices::openUrl(QUrl(qurl));
+        });
     });
 
     // 2.2.37  ReadDirectory

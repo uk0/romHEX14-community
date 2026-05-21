@@ -505,10 +505,19 @@ aggregate(const QVector<LegionVoice> &voices,
             if (vi < 0 || vi >= voices.size()) continue;
             const auto &voice = voices[vi];
 
-            // Local hamming: fraction of voice's touched-and-in-range bytes
-            // where voice.original equals userBaseline at that address.
+            // Local hamming: of the bytes this voice actually CHANGED in
+            // range, how many had an original matching the user's baseline.
+            //
+            // #5: previously this counted every byte voiceByteAt() could
+            // serve — including the unchanged context bytes that detectRegions
+            // merges into a region.  Those trivially match the baseline and
+            // diluted a handful of mismatched *changed* bytes, letting the
+            // wrong version/file pass the gate.  Restrict to addressSet (the
+            // genuinely changed addresses) so the gate measures real fit.
             int touched = 0, matching = 0;
             for (uint32_t a = range.s; a <= range.e; ++a) {
+                if (!voice.addressSet.contains(a)) continue;
+                if (a >= uint32_t(userBaseline.size())) continue;
                 uint8_t b;
                 if (!voiceByteAt(voice, a, /*side=*/0, &b)) continue;
                 ++touched;

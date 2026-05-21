@@ -31,6 +31,7 @@
 #include <QByteArray>
 #include <QDateTime>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QVector>
 
@@ -63,7 +64,7 @@ public:
     /// state.  Subsequent mutations are auto-saved.  Pass nullptr to
     /// detach (e.g. when the project closes).
     void attachTo(Project *project);
-    Project *project() const { return m_project; }
+    Project *project() const;
 
     // ── Mutation ─────────────────────────────────────────────────────
     /// Create a savepoint from the project's current data (relative to
@@ -112,7 +113,7 @@ private:
     QJsonObject       toJson() const;
     bool              fromJson(const QJsonObject &obj);
 
-    Project           *m_project = nullptr;
+    QPointer<Project>  m_project;
     QVector<Savepoint> m_savepoints;
     QString            m_currentId;
 };

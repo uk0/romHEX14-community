@@ -310,17 +310,30 @@ void LegionPreviewWidget::updateVoiceList()
         if (vi < 0 || vi >= m_voices->size()) continue;
         const auto &voice = (*m_voices)[vi];
         auto *it = new QTreeWidgetItem(m_treeVoices);
-        it->setText(0, QFileInfo(voice.sourcePath).fileName());
-        it->setToolTip(0, voice.sourcePath);
+        // #2: attribute the contribution to a concrete .ols version.
+        QString label = QFileInfo(voice.sourcePath).fileName();
+        if (!voice.versionLabel.isEmpty())
+            label += QStringLiteral(" › ") + voice.versionLabel;
+        else if (voice.versionIndex >= 0)
+            label += QStringLiteral(" › v%1").arg(voice.versionIndex);
+        it->setText(0, label);
+        it->setToolTip(0, voice.sourcePath +
+            (voice.versionLabel.isEmpty()
+                ? QString()
+                : QStringLiteral("\nVersion: ") + voice.versionLabel));
         it->setText(1, QStringLiteral("%1%%").arg(voice.similarity));
 
-        // Voice's delta at the densest cell — sum signed differences across
-        // the cell-size bytes for a quick at-a-glance value.
+        // Voice's delta at the densest cell — assemble the cell-size bytes
+        // into orig/mod integer VALUES honouring endianness, then report
+        // their difference (#9: previously summed per-byte differences,
+        // which is wrong for cellSize 2/4 and ignores byte order, so it did
+        // not match the delta the verdict actually applies).
         QString deltaTxt = QStringLiteral("—");
+        const int nBytes = std::min(cellSize, 8);
         if (dCell >= 0) {
-            int64_t deltaSum = 0;
+            uint8_t origBuf[8] = {0}, modBuf[8] = {0};
             bool covered = true;
-            for (int b = 0; b < cellSize; ++b) {
+            for (int b = 0; b < nBytes; ++b) {
                 const uint32_t addr = cellStart + uint32_t(b);
                 int found = -1;
                 int lo = 0, hi = voice.regions.size() - 1;
@@ -338,12 +351,20 @@ void LegionPreviewWidget::updateVoiceList()
                     || off >= r.modifiedBytes.size()) {
                     covered = false; break;
                 }
-                deltaSum += int64_t(uint8_t(r.modifiedBytes[off]))
-                          - int64_t(uint8_t(r.originalBytes[off]));
+                origBuf[b] = uint8_t(r.originalBytes[off]);
+                modBuf[b]  = uint8_t(r.modifiedBytes[off]);
             }
             if (covered) {
+                const bool be = m_verdict->bigEndian;
+                int64_t origVal = 0, modVal = 0;
+                for (int b = 0; b < nBytes; ++b) {
+                    const int shift = be ? (nBytes - 1 - b) : b;
+                    origVal |= int64_t(origBuf[b]) << (8 * shift);
+                    modVal  |= int64_t(modBuf[b])  << (8 * shift);
+                }
+                const int64_t delta = modVal - origVal;
                 deltaTxt = QStringLiteral("%1%2")
-                    .arg(deltaSum >= 0 ? "+" : "").arg(deltaSum);
+                    .arg(delta >= 0 ? "+" : "").arg(delta);
             }
         }
         it->setText(2, deltaTxt);
