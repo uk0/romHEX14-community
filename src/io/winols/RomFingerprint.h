@@ -100,11 +100,18 @@ struct RomFingerprint {
 };
 
 struct SimilarityScore {
-    double wholeFile = 0.0;     // 0..1, Jaccard on wholeFile sets
-    double dataArea  = 0.0;     // 0..1, Jaccard on dataArea sets
+    double wholeFile   = 0.0;   // 0..1, Jaccard on wholeFile sets
+    double dataArea    = 0.0;   // 0..1, reserved (unused by MinHash path)
+    double containment = 0.0;   // 0..1, |A∩B|/min(|A|,|B|) — catches a small
+                                // ROM fully contained in a larger dump, where
+                                // Jaccard would be low purely due to size.
 
-    int  wholePct() const { return int(wholeFile * 100.0 + 0.5); }
-    int  dataPct()  const { return int(dataArea  * 100.0 + 0.5); }
+    int  wholePct() const { return int(wholeFile   * 100.0 + 0.5); }
+    int  dataPct()  const { return int(dataArea    * 100.0 + 0.5); }
+    int  containPct() const { return int(containment * 100.0 + 0.5); }
+    // Headline score: best of Jaccard / containment.
+    double best() const { return wholeFile > containment ? wholeFile : containment; }
+    int  bestPct() const { return int(best() * 100.0 + 0.5); }
 };
 
 /// Compute a fingerprint over @p romBytes (raw ROM, not .ols container).

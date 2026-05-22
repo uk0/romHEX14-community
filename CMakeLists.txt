@@ -188,6 +188,8 @@ set(SOURCES
     src/io/winols/SimilarityIndex.cpp
     src/io/winols/SimilarFilesDlg.cpp
     src/io/winols/BuildIndexProgressDlg.cpp
+    src/io/winols/WolsTwinFinder.cpp
+    src/io/winols/WolsCatalogStore.cpp
     src/io/legion/Legion.cpp
     src/io/legion/LegionDlg.cpp
     src/io/legion/LegionPreviewWidget.cpp
@@ -302,6 +304,8 @@ set(HEADERS
     src/io/winols/SimilarityIndex.h
     src/io/winols/SimilarFilesDlg.h
     src/io/winols/BuildIndexProgressDlg.h
+    src/io/winols/WolsTwinFinder.h
+    src/io/winols/WolsCatalogStore.h
     src/cloud/CloudClient.h
     src/cloud/CloudToolsDlg.h
     src/datalog/LogTable.h

@@ -9,6 +9,9 @@
 #include "io/winols/SimilarityIndex.h"
 #include "io/winols/WinOlsConfig.h"
 #include "io/winols/WinOlsCatalogReader.h"
+#include "io/winols/WolsTwinFinder.h"
+#include "io/winols/WolsCatalogStore.h"
+#include "io/winols/WinOlsOpener.h"
 #include "io/winols/RomFingerprint.h"
 #include "io/ols/OlsImporter.h"
 
@@ -16,7 +19,10 @@
 
 #include <QApplication>
 #include <QDialogButtonBox>
+#include <QDir>
+#include <QDirIterator>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QHBoxLayout>
@@ -29,6 +35,7 @@
 #include <QProgressBar>
 #include <QProgressDialog>
 #include <QPushButton>
+#include <QSet>
 #include <QTime>
 #include <QTimer>
 #include <QSettings>
@@ -342,10 +349,20 @@ SimilarFilesDlg::SimilarFilesDlg(const QString &sourcePath,
     }
     const int rows = m_index->rowCount();
     qCInfo(catFind) << "index rowCount=" << rows;
+
+    // Tryb A — exact + similar WinOLS matches from the local extract DB
+    // (independent of WinOLS's format).  If the extract is empty, offer a
+    // one-time sync first.  Deferred so the prompt appears after the dialog.
+    QTimer::singleShot(0, this, &SimilarFilesDlg::maybeSyncThenFind);
+
     m_status->setText(tr("Index: %1 files cached").arg(rows));
     if (rows == 0) {
-        qCInfo(catFind) << "empty index — scheduling onRebuildIndex";
-        QTimer::singleShot(0, this, &SimilarFilesDlg::onRebuildIndex);
+        // Do NOT auto-launch the (multi-hour) fingerprint rebuild — Tryb A
+        // already gives exact twins from the catalog.  Offer the rebuild
+        // only as an explicit choice for fuzzy similarity.
+        qCInfo(catFind) << "empty index — exact-twin mode only";
+        m_status->setText(tr("Fuzzy index empty — showing exact WinOLS twins. "
+                             "Click “Rebuild index” for fuzzy similarity."));
     } else {
         runQuery();
     }
@@ -428,6 +445,9 @@ void SimilarFilesDlg::buildUi()
     root->addWidget(m_status);
 
     auto *btnRow = new QHBoxLayout();
+    m_syncBtn = new QPushButton(tr("Sync WinOLS"));
+    m_syncBtn->setToolTip(tr("Copy the WinOLS catalog into a local database "
+                             "(read-only, one-time; survives WinOLS format changes)"));
     m_rebuild = new QPushButton(tr("Rebuild index"));
     m_openBtn = new QPushButton(tr("Open"));
     m_openBtn->setObjectName("openBtn");
@@ -435,6 +455,7 @@ void SimilarFilesDlg::buildUi()
     m_cmpBtn  = new QPushButton(tr("Open as comparison"));
     m_cmpBtn->setEnabled(false);
     auto *closeBtn = new QPushButton(tr("Close"));
+    btnRow->addWidget(m_syncBtn);
     btnRow->addWidget(m_rebuild);
     btnRow->addStretch();
     btnRow->addWidget(m_openBtn);
@@ -458,7 +479,7 @@ void SimilarFilesDlg::buildUi()
     connect(m_cmpBtn, &QPushButton::clicked, this, [this]() {
         const auto sel = m_tree->selectedItems();
         if (sel.isEmpty()) return;
-        const QString p = sel.first()->data(0, Qt::UserRole).toString();
+        const QString p = resolveItemPath(sel.first());
         if (!p.isEmpty()) {
             emit compareWithRequested(p);
             accept();
@@ -466,6 +487,8 @@ void SimilarFilesDlg::buildUi()
     });
     connect(m_rebuild, &QPushButton::clicked,
             this, &SimilarFilesDlg::onRebuildIndex);
+    connect(m_syncBtn, &QPushButton::clicked,
+            this, &SimilarFilesDlg::syncWolsCatalog);
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::reject);
 }
 
@@ -567,21 +590,60 @@ void SimilarFilesDlg::onQueryFinished(const QVector<SimilarityMatch> &matches,
     qCInfo(catFind) << "onQueryFinished done";
 }
 
+namespace {
+// Tree item that sorts numerically by a match score stored in UserRole+10
+// (descending in the view), instead of by the fragile "% string".  Used for
+// exact twins, fuzzy candidates and MinHash rows alike so they interleave
+// in a sensible order regardless of which column the user sorts by.
+class MatchItem : public QTreeWidgetItem {
+public:
+    using QTreeWidgetItem::QTreeWidgetItem;
+    bool operator<(const QTreeWidgetItem &o) const override {
+        return data(0, Qt::UserRole + 10).toDouble()
+             < o.data(0, Qt::UserRole + 10).toDouble();
+    }
+};
+}  // namespace
+
 void SimilarFilesDlg::populateTable(const QVector<SimilarityMatch> &matches)
 {
     qCInfo(catFind) << "populateTable: " << matches.size() << " matches";
     m_tree->setSortingEnabled(false);
-    m_tree->clear();
+
+    // Keep the exact-twin rows (Tryb A) on top; drop only the previous
+    // fuzzy rows.  Exact rows are tagged with UserRole+5 == true.
+    QSet<QString> exactPaths;
+    for (int i = m_tree->topLevelItemCount() - 1; i >= 0; --i) {
+        QTreeWidgetItem *it = m_tree->topLevelItem(i);
+        if (it->data(0, Qt::UserRole + 5).toBool()) {
+            const QString p = it->data(0, Qt::UserRole).toString();
+            if (!p.isEmpty()) exactPaths.insert(p);
+        } else {
+            delete m_tree->takeTopLevelItem(i);
+        }
+    }
+
     for (const auto &m : matches) {
-        auto *it = new QTreeWidgetItem({
-            QString("%1%").arg(m.score.wholePct(), 3),
+        if (!m.path.isEmpty() && exactPaths.contains(m.path))
+            continue;   // already shown as an exact WinOLS twin
+        // Headline % is the best of Jaccard / containment, so a small ROM
+        // fully inside a larger dump still scores high.  Append the .ols
+        // version label that actually matched, when present.
+        const QString fname = QFileInfo(m.path).fileName()
+            + (m.versionLabel.isEmpty() ? QString()
+                  : QStringLiteral(" [%1]").arg(m.versionLabel));
+        auto *it = new MatchItem(QStringList{
+            QString("%1%").arg(m.score.bestPct(), 3),
             QStringLiteral("…"),                      // byte-match placeholder
             tr("(file)"),
             QString(), QString(), QString(), QString(),
-            QFileInfo(m.path).fileName()
+            fname
         });
         it->setData(0, Qt::UserRole, m.path);
-        it->setData(0, Qt::UserRole + 1, double(m.score.wholeFile));
+        it->setData(0, Qt::UserRole + 1, double(m.score.best()));
+        it->setData(0, Qt::UserRole + 10, double(m.score.bestPct()));
+        it->setToolTip(0, tr("Jaccard %1%  ·  containment %2%")
+                              .arg(m.score.wholePct()).arg(m.score.containPct()));
         it->setToolTip(7, m.path);
         m_tree->addTopLevelItem(it);
     }
@@ -592,6 +654,359 @@ void SimilarFilesDlg::populateTable(const QVector<SimilarityMatch> &matches)
     // N rows by MinHash score.  This is the only honest way to tell
     // a real byte-twin from an n-gram lookalike.
     scheduleByteMatchScan(matches);
+}
+
+// ── Tryb A: exact WinOLS twins straight from the catalog ────────────────
+//
+// Computes the needle's CRC32 region identity and matches it against the
+// `colx4` fingerprints stored in every Cache_*.db.  Deterministic, needs
+// no MinHash index, and works even when that index is empty/broken.
+
+void SimilarFilesDlg::maybeSyncThenFind()
+{
+    if (m_romBytes.isEmpty()) return;
+    bool populated = false;
+    {
+        WolsCatalogStore store;
+        QString e;
+        if (store.open(&e)) populated = store.isPopulated();
+    }
+    if (populated) { findExactTwins(); return; }
+
+    qCInfo(catFind) << "WinOLS extract empty — offering one-time sync";
+    const auto r = QMessageBox::question(this, tr("Find similar"),
+        tr("The WinOLS catalog hasn't been copied locally yet.\n\n"
+           "Copy it now? This reads your WinOLS Cache_*.db once (read-only) into "
+           "a local database, so similarity search works without touching WinOLS "
+           "again — and keeps working even if WinOLS later changes its format."),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+    if (r == QMessageBox::Yes)
+        syncWolsCatalog();
+    else
+        m_status->setText(tr("WinOLS catalog not copied locally — "
+                             "click “Sync WinOLS” to enable similarity search."));
+}
+
+void SimilarFilesDlg::syncWolsCatalog()
+{
+    if (m_syncRunning.exchange(true)) return;
+    qCInfo(catFind) << "syncWolsCatalog start";
+
+    auto *prog = new QProgressDialog(
+        tr("Copying WinOLS catalog locally (one-time)…"),
+        QString() /* no cancel button */, 0, 0, this);
+    prog->setWindowTitle(tr("Sync WinOLS catalog"));
+    prog->setWindowModality(Qt::WindowModal);
+    prog->setMinimumDuration(0);
+    prog->setAutoClose(false);
+    prog->setAutoReset(false);
+    prog->setValue(0);
+    prog->show();
+
+    QPointer<QProgressDialog> pp = prog;
+    auto *watcher = new QFutureWatcher<SyncStats>(this);
+    connect(watcher, &QFutureWatcher<SyncStats>::finished, this, [this, watcher, pp]() {
+        m_syncRunning.store(false);
+        SyncStats st;
+        try { st = watcher->result(); } catch (...) {}
+        if (pp) { pp->close(); pp->deleteLater(); }
+        m_status->setText(tr("WinOLS catalog copied: %1 files · %2 source DBs "
+                             "(%3 unreadable) · %4 ms")
+                              .arg(st.rowsTotal)
+                              .arg(st.dbsScanned + st.dbsSkipped)
+                              .arg(st.dbsFailed)
+                              .arg(st.elapsedMs));
+        findExactTwins();
+        watcher->deleteLater();
+    });
+    watcher->setFuture(QtConcurrent::run([pp]() {
+        WolsTwinFinder f;
+        return f.sync([pp](int done, int total, const QString &cur) {
+            QMetaObject::invokeMethod(qApp, [pp, done, total, cur]() {
+                if (!pp) return;
+                pp->setMaximum(total);
+                pp->setValue(done);
+                if (!cur.isEmpty())
+                    pp->setLabelText(QObject::tr("Copying WinOLS catalog: %1").arg(cur));
+            }, Qt::QueuedConnection);
+        });
+    }));
+}
+
+namespace { struct ExactFindResult { QVector<ExactTwin> twins; qint64 rs = -1, re = -1; }; }
+
+void SimilarFilesDlg::findExactTwins()
+{
+    if (m_romBytes.isEmpty()) return;
+    if (m_exactRunning.exchange(true)) return;
+    qCInfo(catFind) << "findExactTwins start; romBytes=" << m_romBytes.size();
+
+    const QByteArray bytes = m_romBytes;
+    auto *watcher = new QFutureWatcher<ExactFindResult>(this);
+    connect(watcher, &QFutureWatcher<ExactFindResult>::finished,
+            this, [this, watcher]() {
+        m_exactRunning.store(false);
+        try {
+            const ExactFindResult fr = watcher->result();
+            m_dataStart = fr.rs;
+            m_dataEnd   = fr.re;
+            populateExactTwins(fr.twins);
+            computeSimilarPercents(fr.twins);
+        } catch (const std::exception &e) {
+            qCCritical(catFind) << "findExactTwins worker threw:" << e.what();
+        } catch (...) {
+            qCCritical(catFind) << "findExactTwins worker threw unknown";
+        }
+        watcher->deleteLater();
+    });
+    watcher->setFuture(QtConcurrent::run([bytes]() {
+        ExactFindResult fr;
+        WolsTwinFinder finder;
+        QPair<qint64, qint64> region(-1, -1);
+        fr.twins = finder.find(bytes, &region);
+        fr.rs = region.first;
+        fr.re = region.second;
+        return fr;
+    }));
+}
+
+void SimilarFilesDlg::populateExactTwins(const QVector<ExactTwin> &twins)
+{
+    if (!m_tree) return;
+    qCInfo(catFind) << "populateExactTwins:" << twins.size() << "twins";
+
+    m_tree->setSortingEnabled(false);
+
+    // Idempotent: drop any previous exact-twin rows (UserRole+5 flag),
+    // leave fuzzy rows untouched.
+    for (int i = m_tree->topLevelItemCount() - 1; i >= 0; --i) {
+        QTreeWidgetItem *it = m_tree->topLevelItem(i);
+        if (it->data(0, Qt::UserRole + 5).toBool())
+            delete m_tree->takeTopLevelItem(i);
+    }
+
+    const QString srcAbs = m_sourcePath.isEmpty()
+        ? QString() : QFileInfo(m_sourcePath).absoluteFilePath();
+    const QColor green("#3fb950");
+    const QColor amber("#d29922");
+    int exact = 0, similar = 0;
+    for (const ExactTwin &t : twins) {
+        // Never list the source file itself.
+        if (!t.path.isEmpty() && !srcAbs.isEmpty() &&
+            QFileInfo(t.path).absoluteFilePath().compare(
+                srcAbs, Qt::CaseInsensitive) == 0)
+            continue;
+
+        MatchItem *it;
+        if (t.similar) {
+            // Fuzzy candidate: project not matched here; the data-area %
+            // is computed for real afterwards (computeSimilarPercents).
+            // Until then show a provisional estimate from the fingerprint.
+            const int est = qBound(0, int(100.0 * (1.0 - t.dataDist) + 0.5), 100);
+            it = new MatchItem(QStringList{
+                QStringLiteral("-"),
+                QStringLiteral("~%1%").arg(est),
+                tr("WinOLS similar (data area)"),
+                t.make, t.model, t.ecuModel, t.swNumber, t.filename});
+            for (int c = 0; c < 3; ++c) it->setForeground(c, amber);
+            it->setData(0, Qt::UserRole + 9, true);          // is-similar
+            it->setData(0, Qt::UserRole + 10, double(est));  // sort key (refined)
+            ++similar;
+        } else {
+            QString tag;
+            if (t.projectTwin && t.dataTwin) tag = tr("WinOLS twin (project + data)");
+            else if (t.projectTwin)          tag = tr("WinOLS twin (project)");
+            else                             tag = tr("WinOLS twin (data area)");
+            it = new MatchItem(QStringList{
+                t.projectTwin ? QStringLiteral("100%") : QStringLiteral("-"),
+                t.dataTwin    ? QStringLiteral("100%") : QStringLiteral("-"),
+                tag, t.make, t.model, t.ecuModel, t.swNumber, t.filename});
+            for (int c = 0; c < 3; ++c) it->setForeground(c, green);
+            it->setData(0, Qt::UserRole + 10, t.projectTwin ? 100.5 : 100.0);
+            ++exact;
+        }
+        it->setData(0, Qt::UserRole, t.path);          // resolved path (may be empty)
+        it->setData(0, Qt::UserRole + 5, true);        // catalog-row marker (lazy open)
+        it->setData(0, Qt::UserRole + 6, t.dbBasename);
+        it->setData(0, Qt::UserRole + 7, t.filename);
+        it->setToolTip(7, t.path.isEmpty()
+            ? tr("%1 (catalog: %2) — double-click to locate & open")
+                  .arg(t.filename, t.dbBasename)
+            : t.path);
+        m_tree->addTopLevelItem(it);
+    }
+
+    m_tree->setSortingEnabled(true);
+    m_tree->sortByColumn(0, Qt::DescendingOrder);
+
+    if (exact + similar > 0) {
+        m_status->setText(tr("%1 exact + %2 similar WinOLS match(es) — "
+                             "computing exact %…").arg(exact).arg(similar));
+    }
+    qCInfo(catFind) << "populateExactTwins done; exact=" << exact
+                    << "similar=" << similar;
+}
+
+namespace {
+
+// Fraction (0..1) of matching bytes of @p pat against @p hay at offset @p off,
+// sampling every @p step bytes.  -1 if the window doesn't fit.
+double scorePatternAt(const QByteArray &pat, const QByteArray &hay,
+                      int off, int step)
+{
+    const int sz = pat.size();
+    if (off < 0 || off + sz > hay.size()) return -1.0;
+    const auto *pp = reinterpret_cast<const uint8_t *>(pat.constData());
+    const auto *ph = reinterpret_cast<const uint8_t *>(hay.constData());
+    int n = 0, m = 0;
+    for (int i = 0; i < sz; i += step) { if (pp[i] == ph[off + i]) ++m; ++n; }
+    return n ? double(m) / n : -1.0;
+}
+
+// Matching fraction of the needle data region @p region against @p hay,
+// ADDRESS-ALIGNED like WinOLS's data-area %: the region sits at the same
+// offset in a same-layout ROM; in a partial file that *is* the data region
+// it sits at offset 0.  No free slide — sliding finds spurious high matches
+// where the calibration region happens to line up over common code/padding
+// (that produced bogus 98% where the true data-area match was 66%).
+double bestRegionMatch(const QByteArray &region, const QByteArray &hay,
+                       qint64 preferred)
+{
+    if (region.isEmpty() || hay.isEmpty()) return 0.0;
+    double s = -1.0;
+    if (preferred >= 0 && preferred + region.size() <= hay.size())
+        s = scorePatternAt(region, hay, int(preferred), 1);   // same layout
+    else if (region.size() <= hay.size())
+        s = scorePatternAt(region, hay, 0, 1);                // partial file
+    return s < 0.0 ? 0.0 : s;
+}
+
+}  // namespace
+
+void SimilarFilesDlg::computeSimilarPercents(const QVector<ExactTwin> &twins)
+{
+    if (m_simPctRunning.exchange(true)) return;
+
+    struct Cand { QString db, fn; };
+    QVector<Cand> cands;
+    for (const ExactTwin &t : twins)
+        if (t.similar) cands.append({t.dbBasename, t.filename});
+
+    if (cands.isEmpty() || m_dataStart < 0 || m_dataEnd < m_dataStart ||
+        m_dataStart >= m_romBytes.size()) {
+        m_simPctRunning.store(false);
+        return;
+    }
+    const qint64 len = qMin<qint64>(m_dataEnd - m_dataStart + 1,
+                                    m_romBytes.size() - m_dataStart);
+    const QByteArray region = m_romBytes.mid(int(m_dataStart), int(len));
+    const qint64 preferred  = m_dataStart;
+    qCInfo(catFind) << "computeSimilarPercents:" << cands.size()
+                    << "candidates; region=" << region.size() << "B";
+
+    Config cfg;
+    const QStringList roots          = cfg.scanFallback();
+    const QHash<QString, QString> fr = cfg.fileRoots();
+    QPointer<SimilarFilesDlg> self = this;
+
+    (void)QtConcurrent::run([self, cands, region, roots, fr, preferred]() {
+        // 1. Resolve filenames -> paths: fileRoots fast path, then ONE
+        //    recursive walk over scanFallback (early-exit when all found).
+        QHash<QString, QString> pathByKey;          // "db|fn" -> path
+        QHash<QString, QVector<int>> needed;        // lower(fn) -> cand idx
+        for (int i = 0; i < cands.size(); ++i) {
+            const Cand &c = cands[i];
+            auto it = fr.constFind(c.db);
+            if (it != fr.constEnd()) {
+                const QString cand = QDir(it.value()).filePath(c.fn);
+                if (QFileInfo::exists(cand)) {
+                    pathByKey.insert(c.db + QLatin1Char('|') + c.fn, cand);
+                    continue;
+                }
+            }
+            needed[c.fn.toLower()].append(i);
+        }
+        for (const QString &root : roots) {
+            if (needed.isEmpty()) break;
+            QDirIterator scan(root, QDir::Files, QDirIterator::Subdirectories);
+            while (scan.hasNext()) {
+                scan.next();
+                auto it = needed.find(scan.fileName().toLower());
+                if (it != needed.end()) {
+                    for (int idx : it.value())
+                        pathByKey.insert(cands[idx].db + QLatin1Char('|')
+                                         + cands[idx].fn, scan.filePath());
+                    needed.erase(it);
+                    if (needed.isEmpty()) break;
+                }
+            }
+        }
+
+        // 2. Read + extract + compare each candidate -> emit true %.
+        for (const Cand &c : cands) {
+            if (!self) return;
+            const QString path = pathByKey.value(c.db + QLatin1Char('|') + c.fn);
+            double pct = -1.0;
+            if (!path.isEmpty()) {
+                QFile f(path);
+                if (f.open(QIODevice::ReadOnly)) {
+                    const QByteArray raw = f.readAll();
+                    f.close();
+                    QVector<QByteArray> streams;
+                    streams.append(raw);
+                    try {
+                        ols::OlsImportResult r =
+                            ols::OlsImporter::importFromBytes(raw);
+                        if (r.error.isEmpty())
+                            for (const auto &v : r.versions)
+                                if (!v.romData.isEmpty()) streams.append(v.romData);
+                    } catch (...) {}
+                    double best = 0.0;
+                    for (const QByteArray &s : streams)
+                        best = qMax(best, bestRegionMatch(region, s, preferred));
+                    pct = best * 100.0;
+                }
+            }
+            const QString cdb = c.db, cfn = c.fn;
+            QMetaObject::invokeMethod(self.data(),
+                [self, cdb, cfn, pct, path]() {
+                    if (self) self->onSimilarPctResult(cdb, cfn, pct, path);
+                }, Qt::QueuedConnection);
+        }
+        QMetaObject::invokeMethod(self.data(), [self]() {
+            if (!self) return;
+            self->m_simPctRunning.store(false);
+            qCInfo(catFind) << "computeSimilarPercents done";
+        }, Qt::QueuedConnection);
+    });
+}
+
+void SimilarFilesDlg::onSimilarPctResult(const QString &dbBasename,
+                                         const QString &filename,
+                                         double dataPct, const QString &path)
+{
+    if (!m_tree) return;
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *it = m_tree->topLevelItem(i);
+        if (!it->data(0, Qt::UserRole + 9).toBool()) continue;   // similar only
+        if (it->data(0, Qt::UserRole + 6).toString() != dbBasename) continue;
+        if (it->data(0, Qt::UserRole + 7).toString() != filename) continue;
+
+        if (!path.isEmpty() && it->data(0, Qt::UserRole).toString().isEmpty()) {
+            it->setData(0, Qt::UserRole, path);
+            it->setToolTip(7, path);
+        }
+        if (dataPct >= 0.0) {
+            it->setText(1, QStringLiteral("%1%").arg(dataPct, 0, 'f', 0));
+            it->setData(0, Qt::UserRole + 10, dataPct);
+            it->setForeground(1, dataPct >= 95.0 ? QColor("#3fb950")
+                               : dataPct >= 70.0 ? QColor("#d29922")
+                                                 : QColor("#f0883e"));
+        } else {
+            it->setText(1, tr("n/a"));   // file not on disk / unreadable
+        }
+        break;
+    }
 }
 
 namespace {
@@ -724,27 +1139,29 @@ void SimilarFilesDlg::applyCatalogToRows()
     int matched = 0;
     for (int i = 0; i < N; ++i) {
         QTreeWidgetItem *it = m_tree->topLevelItem(i);
-        const QString fn = it->text(6);
+        if (it->data(0, Qt::UserRole + 5).toBool())
+            continue;   // exact WinOLS twin — already carries its own metadata
+        // Columns: 0 %Match | 1 Byte% | 2 Source | 3 Make | 4 Model |
+        //          5 ECU | 6 SW | 7 File.  The filename lives in col 7.
+        const QString fn = it->text(7);
         auto found = byName.constFind(fn);
         if (found == byName.constEnd()) continue;
 
         ++matched;
         const QString path = it->data(0, Qt::UserRole).toString();
         const auto &r = found.value();
-        it->setText(1, QFileInfo(path).dir().dirName());
-        it->setText(2, r.make);
-        it->setText(3, r.model);
-        it->setText(4, r.ecuModel);
-        it->setText(5, r.swNumber);
+        it->setText(2, QFileInfo(path).dir().dirName());   // Source = folder
+        it->setText(3, r.make);
+        it->setText(4, r.model);
+        it->setText(5, r.ecuModel);
+        it->setText(6, r.swNumber);
 
-        // populateTable() already set a path-only tooltip on column 6;
-        // upgrade it with versions when we have them.  Setting tooltip on
-        // every column of every row was the prior bottleneck (5000 × 7
-        // setToolTip calls = ~2 s).  Hovering the File column to read the
-        // tooltip is the natural interaction.
+        // Upgrade the File-column tooltip with version names when known.
+        // Setting tooltips on every column of every row was the prior
+        // bottleneck; hovering the File column is the natural interaction.
         const QStringList vers = parseVersionNames(r.versionsInfo);
         if (!vers.isEmpty()) {
-            it->setToolTip(6, path + QStringLiteral("\nVersions: ")
+            it->setToolTip(7, path + QStringLiteral("\nVersions: ")
                               + vers.join(QStringLiteral(", ")));
         }
     }
@@ -763,6 +1180,33 @@ void SimilarFilesDlg::onMinChanged(int v)
     runQuery();
 }
 
+QString SimilarFilesDlg::resolveItemPath(QTreeWidgetItem *it)
+{
+    if (!it) return {};
+    QString p = it->data(0, Qt::UserRole).toString();
+    if (!p.isEmpty()) return p;
+    if (!it->data(0, Qt::UserRole + 5).toBool()) return {};   // not an exact twin
+
+    // Exact WinOLS twin not yet resolved — locate it on disk now (the
+    // recursive scanFallback search is deferred to this point).
+    const QString db = it->data(0, Qt::UserRole + 6).toString();
+    const QString fn = it->data(0, Qt::UserRole + 7).toString();
+    qCInfo(catFind) << "lazy-resolving twin" << fn << "from" << db;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    Config cfg;
+    QString err;
+    p = Opener::resolve(cfg, db, fn, &err);
+    QApplication::restoreOverrideCursor();
+    if (p.isEmpty()) {
+        QMessageBox::information(this, tr("Find similar"),
+            tr("Could not locate the file on disk:\n%1\n\n%2").arg(fn, err));
+        return {};
+    }
+    it->setData(0, Qt::UserRole, p);   // cache for next time
+    it->setToolTip(7, p);
+    return p;
+}
+
 void SimilarFilesDlg::onRowActivated(QTreeWidgetItem *it, int)
 {
     qCInfo(catFind) << "onRowActivated";
@@ -770,10 +1214,10 @@ void SimilarFilesDlg::onRowActivated(QTreeWidgetItem *it, int)
         qCWarning(catFind) << "onRowActivated: null item";
         return;
     }
-    const QString p = it->data(0, Qt::UserRole).toString();
+    const QString p = resolveItemPath(it);
     qCInfo(catFind) << "  selected path=" << p;
     if (p.isEmpty()) {
-        qCWarning(catFind) << "onRowActivated: empty path on item";
+        qCWarning(catFind) << "onRowActivated: empty/unresolved path on item";
         return;
     }
     m_chosen = p;
@@ -850,73 +1294,89 @@ void SimilarFilesDlg::scheduleByteMatchScan(const QVector<SimilarityMatch> &matc
                 }
             } catch (...) {}
 
-            // ── Byte-match with offset search ──────────────────────────
+            // ── Byte-match with anchor-based offset search ─────────────
             //
-            // Common case: needle is a bench-full dump (5-8 MB, multiple
-            // flash regions concatenated), candidate is one calibration
-            // partition (~2 MB).  Comparing at offset 0 just lines up
-            // bootloader-vs-calibration → ~10% incidental match.
+            // The needle and a candidate often differ in size (a small
+            // calibration partition vs a 5-8 MB bench-full dump, or the
+            // reverse).  Treat the SMALLER buffer as the probe and find
+            // where it best aligns inside the LARGER one, then report
+            // match% over the smaller buffer (a containment-style score).
             //
-            // To find the real alignment we slide the candidate over the
-            // needle at 64 KB granularity, computing a *sampled* score
-            // (every 256th byte) on each step.  Top-3 candidate offsets
-            // then get re-scored at full byte resolution; whichever
-            // wins is taken as the file's true byte-match.
-            const auto *pa = reinterpret_cast<const uint8_t *>(needle.constData());
-            const int nN = needle.size();
+            // Alignment offsets come from CONTENT ANCHORS — a handful of
+            // non-padding 24-byte sequences from the probe, located in the
+            // larger buffer via indexOf — plus offset 0 and a coarse 64 KB
+            // grid as fallback.  Anchors catch odd shifts (80-byte headers,
+            // 0x1000, atypical layouts) that a fixed-grid slide would miss.
+            auto bestAlign = [](const QByteArray &big,
+                                const QByteArray &small) -> std::pair<int, int> {
+                const int bigN = big.size(), smallN = small.size();
+                if (smallN == 0 || smallN > bigN) return {0, 0};
+                const auto *pb = reinterpret_cast<const uint8_t *>(big.constData());
+                const auto *ps = reinterpret_cast<const uint8_t *>(small.constData());
 
-            auto scoreAt = [&](const QByteArray &cand, int off, int step) {
-                const int sz = cand.size();
-                if (off < 0 || off + sz > nN) return std::make_pair(0, 0);
-                const auto *pb = reinterpret_cast<const uint8_t *>(cand.constData());
-                int n = 0, m = 0;
-                for (int i = 0; i < sz; i += step) {
-                    if (pa[off + i] == pb[i]) ++m;
-                    ++n;
+                QVector<int> offs;
+                offs.append(0);
+                constexpr int kAnchorLen = 24;
+                if (smallN >= kAnchorLen) {
+                    constexpr int kAnchors = 8;
+                    for (int a = 0; a < kAnchors; ++a) {
+                        const int sp = int(qint64(a) * (smallN - kAnchorLen)
+                                           / qMax(1, kAnchors - 1));
+                        bool uniform = true;     // skip padding anchors
+                        for (int k = 1; k < kAnchorLen; ++k)
+                            if (ps[sp + k] != ps[sp]) { uniform = false; break; }
+                        if (uniform) continue;
+                        const QByteArray anchor =
+                            QByteArray::fromRawData(small.constData() + sp, kAnchorLen);
+                        int idx = big.indexOf(anchor), hits = 0;
+                        while (idx >= 0 && hits < 4) {
+                            const int off = idx - sp;
+                            if (off >= 0 && off + smallN <= bigN) offs.append(off);
+                            idx = big.indexOf(anchor, idx + 1);
+                            ++hits;
+                        }
+                    }
                 }
-                return std::make_pair(m, n);
+                for (int off = 0; off + smallN <= bigN; off += 64 * 1024)
+                    offs.append(off);
+                std::sort(offs.begin(), offs.end());
+                offs.erase(std::unique(offs.begin(), offs.end()), offs.end());
+
+                // Rank offsets by a sampled score, then full-score the top few.
+                QVector<QPair<int, int>> sampled;   // (sampledMatch, off)
+                for (int off : offs) {
+                    int m = 0;
+                    for (int i = 0; i < smallN; i += 64)
+                        if (pb[off + i] == ps[i]) ++m;
+                    sampled.append({m, off});
+                }
+                std::sort(sampled.begin(), sampled.end(),
+                          [](const QPair<int,int> &a, const QPair<int,int> &b) {
+                              return a.first > b.first;
+                          });
+                int bestM = 0;
+                const int K = qMin(4, sampled.size());
+                for (int t = 0; t < K; ++t) {
+                    const int off = sampled[t].second;
+                    int m = 0;
+                    for (int i = 0; i < smallN; ++i)
+                        if (pb[off + i] == ps[i]) ++m;
+                    if (m > bestM) bestM = m;
+                }
+                return {bestM, smallN};
             };
 
             int bestMatch = 0, bestN = 0;
+            double bestFrac = -1.0;
             for (const QByteArray &cand : candidates) {
                 if (cand.isEmpty()) continue;
-                const int sz = cand.size();
-                if (sz > nN) {
-                    // Candidate bigger than needle — just byte-compare on
-                    // the smaller window (rare case).
-                    auto [m, n] = scoreAt(cand, 0, 1);
-                    if (n > 0 && m * bestN > bestMatch * n) { bestMatch = m; bestN = n; }
-                    else if (bestN == 0)                    { bestMatch = m; bestN = n; }
-                    continue;
-                }
-
-                // Stage 1 — coarse sample-scan at 64 KB steps.
-                const int kStride = 64 * 1024;
-                struct Cand { int off, m, n; };
-                QVector<Cand> tops;
-                for (int off = 0; off + sz <= nN; off += kStride) {
-                    auto [m, n] = scoreAt(cand, off, 256);
-                    tops.append({off, m, n});
-                }
-                if (tops.isEmpty()) {
-                    auto [m, n] = scoreAt(cand, 0, 1);
-                    if (n > 0 && m * bestN > bestMatch * n) { bestMatch = m; bestN = n; }
-                    else if (bestN == 0)                    { bestMatch = m; bestN = n; }
-                    continue;
-                }
-                // Stage 2 — keep the 3 best offsets, rescore at full res.
-                std::partial_sort(tops.begin(),
-                    tops.begin() + qMin(3, tops.size()), tops.end(),
-                    [](const Cand &a, const Cand &b) {
-                        return double(a.m) / qMax(1, a.n)
-                             > double(b.m) / qMax(1, b.n);
-                    });
-                const int K = qMin(3, tops.size());
-                for (int t = 0; t < K; ++t) {
-                    auto [m, n] = scoreAt(cand, tops[t].off, 1);
-                    if (n > 0 && m * bestN > bestMatch * n) { bestMatch = m; bestN = n; }
-                    else if (bestN == 0)                    { bestMatch = m; bestN = n; }
-                }
+                const bool candBigger = cand.size() >= needle.size();
+                const QByteArray &big   = candBigger ? cand : needle;
+                const QByteArray &small = candBigger ? needle : cand;
+                auto [m, tot] = bestAlign(big, small);
+                if (tot <= 0) continue;
+                const double frac = double(m) / double(tot);
+                if (frac > bestFrac) { bestFrac = frac; bestMatch = m; bestN = tot; }
             }
             if (bestN <= 0) return;
             const double pct = double(bestMatch) * 100.0 / double(bestN);

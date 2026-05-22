@@ -40,6 +40,7 @@ class SimilarityIndex;
 struct CatalogRecord;
 struct RomFingerprint;
 struct SimilarityMatch;
+struct ExactTwin;
 
 class SimilarFilesDlg : public QDialog {
     Q_OBJECT
@@ -73,6 +74,22 @@ private:
     void applyCatalogToRows();
     void scheduleByteMatchScan(const QVector<SimilarityMatch> &matches);
 
+    // Tryb A — exact WinOLS twins, read from the local extract DB
+    // (CRC32 region identity), independent of the MinHash index.
+    void maybeSyncThenFind();   // sync the extract first if it's empty
+    void syncWolsCatalog();     // (re)build the local WinOLS extract
+    void findExactTwins();
+    void populateExactTwins(const QVector<ExactTwin> &twins);
+    // Returns a row's on-disk path, lazily resolving an exact-twin row
+    // (recursive scanFallback search) the first time it's needed.
+    QString resolveItemPath(QTreeWidgetItem *it);
+    // Tryb B: for fuzzy candidates, compute the TRUE data-area byte-% by
+    // reading + extracting each candidate and comparing the needle's data
+    // region.  Runs on a worker thread; rows update as results arrive.
+    void computeSimilarPercents(const QVector<ExactTwin> &twins);
+    void onSimilarPctResult(const QString &dbBasename, const QString &filename,
+                            double dataPct, const QString &resolvedPath);
+
     QString m_sourcePath;
     QByteArray m_romBytes;
     QString m_chosen;
@@ -91,6 +108,12 @@ private:
     QPushButton  *m_cmpBtn   = nullptr;
     QPushButton  *m_rebuild  = nullptr;
     std::atomic<bool> m_queryRunning{false};
+    std::atomic<bool> m_exactRunning{false};
+    std::atomic<bool> m_simPctRunning{false};
+    std::atomic<bool> m_syncRunning{false};
+    QPushButton  *m_syncBtn  = nullptr;
+    qint64 m_dataStart = -1;   // needle data-region [start,end] (from a twin)
+    qint64 m_dataEnd   = -1;
     QHash<QString, double> m_byteMatchCache;
 };
 

@@ -69,6 +69,8 @@ private:
     QJsonObject cmdRemoveAnno(const QJsonObject &args);
     QJsonObject cmdDumpOlsRom(const QJsonObject &args);
     QJsonObject cmdRunLua(const QJsonObject &args);     // Sprint L §5.0.5
+    QJsonObject cmdRebuildIndex(const QJsonObject &args); // scoped MinHash rebuild test
+    QJsonObject cmdFindFiles(const QJsonObject &args);    // MinHash findSimilar test
 
     MainWindow *m_mw = nullptr;
     QTcpServer *m_server = nullptr;

@@ -12,15 +12,24 @@
 #include "logger.h"
 #include "mainwindow.h"
 #include "io/ols/OlsImporter.h"
+#include "io/winols/SimilarityIndex.h"
+#include "io/winols/WinOlsConfig.h"
 
+#include <QByteArrayView>
 #include <QCryptographicHash>
+#include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonValue>
+#include <QtConcurrent>
+
+#include <atomic>
+#include <memory>
 
 DebugRpc::DebugRpc(MainWindow *mw, QObject *parent)
     : QObject(parent), m_mw(mw)
@@ -157,6 +166,8 @@ QJsonObject DebugRpc::dispatch(const QJsonObject &request)
     else if (cmd == "remove_anno")  resp = cmdRemoveAnno(args);
     else if (cmd == "dump_ols_rom") resp = cmdDumpOlsRom(args);
     else if (cmd == "lua_run")      resp = cmdRunLua(args);
+    else if (cmd == "rebuild_index") resp = cmdRebuildIndex(args);
+    else if (cmd == "find_files")    resp = cmdFindFiles(args);
     else {
         resp.insert("ok", false);
         resp.insert("error", QStringLiteral("unknown cmd: %1").arg(cmd));
@@ -619,6 +630,122 @@ QJsonObject DebugRpc::cmdRunLua(const QJsonObject &args)
         return r;
     }
     return lua::LuaEngine::instance().runFile(file);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Scoped MinHash index rebuild (dev/test).  Runs the real
+//  SimilarityIndex::rebuild on a detached worker (same path the UI uses),
+//  so we can verify it at controlled scale without an hours-long full scan.
+//  args: { "roots": ["C:/ROMs", ...] }  — defaults to configured scanFallback.
+// ─────────────────────────────────────────────────────────────────────────────
+QJsonObject DebugRpc::cmdRebuildIndex(const QJsonObject &args)
+{
+    QJsonObject r;
+    QStringList roots;
+    for (const QJsonValue &v : args.value(QStringLiteral("roots")).toArray())
+        roots << v.toString();
+    if (roots.isEmpty()) {
+        winols::Config cfg;
+        roots = cfg.scanFallback();
+    }
+    if (roots.isEmpty()) {
+        r.insert("ok", false);
+        r.insert("error", QStringLiteral("no roots (pass 'roots' or configure scanFallback)"));
+        return r;
+    }
+
+    static std::atomic<bool> running{false};
+    if (running.exchange(true)) {
+        r.insert("ok", false);
+        r.insert("error", QStringLiteral("rebuild already running"));
+        return r;
+    }
+
+    auto idx = std::make_shared<winols::SimilarityIndex>();
+    QString err;
+    if (!idx->open(&err)) {
+        running.store(false);
+        r.insert("ok", false);
+        r.insert("error", QStringLiteral("index open failed: ") + err);
+        return r;
+    }
+    const int before = idx->rowCount();
+    const QString dbp = idx->dbPath();
+
+    (void)QtConcurrent::run([idx, roots]() {
+        idx->rebuild(roots);
+        running.store(false);   // static local — accessible without capture
+    });
+
+    r.insert("ok", true);
+    QJsonObject result;
+    result.insert("started", true);
+    result.insert("roots", int(roots.size()));
+    result.insert("rowsBefore", before);
+    result.insert("dbPath", dbp);
+    r.insert("result", result);
+    return r;
+}
+
+// MinHash findSimilar test: fingerprint a file and query the local index.
+// args: { "path": "...", "minPct": 30, "limit": 20 }
+QJsonObject DebugRpc::cmdFindFiles(const QJsonObject &args)
+{
+    QJsonObject r;
+    const QString path = args.value(QStringLiteral("path")).toString();
+    const int minPct = args.value(QStringLiteral("minPct")).toInt(30);
+    const int limit  = args.value(QStringLiteral("limit")).toInt(20);
+
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        r.insert("ok", false);
+        r.insert("error", QStringLiteral("cannot open ") + path);
+        return r;
+    }
+    QByteArray raw = f.read(64 * 1024 * 1024);
+    f.close();
+
+    // Needle = inner ROM for .ols/.kp, else raw bytes.
+    QByteArray rom = raw;
+    const QString ext = QFileInfo(path).suffix().toLower();
+    if (ext == QStringLiteral("ols") || ext == QStringLiteral("kp")) {
+        const ols::OlsImportResult res = ols::OlsImporter::importFromBytes(raw);
+        if (res.error.isEmpty() && !res.versions.isEmpty())
+            rom = res.versions.first().romData;
+    }
+
+    const winols::RomFingerprint fp = winols::fingerprint(QByteArrayView(rom));
+    winols::SimilarityIndex idx;
+    QString e;
+    if (!idx.open(&e)) {
+        r.insert("ok", false);
+        r.insert("error", QStringLiteral("index open: ") + e);
+        return r;
+    }
+    QElapsedTimer t; t.start();
+    const auto matches = idx.findSimilar(fp, minPct, limit);
+    const qint64 ms = t.elapsed();
+
+    QJsonArray arr;
+    for (const auto &m : matches) {
+        QJsonObject o;
+        o.insert("file", QFileInfo(m.path).fileName());
+        o.insert("version", m.versionLabel);
+        o.insert("pct", m.score.bestPct());
+        o.insert("jaccard", m.score.wholePct());
+        o.insert("containment", m.score.containPct());
+        arr.append(o);
+    }
+    QJsonObject res;
+    res.insert("needle", QFileInfo(path).fileName());
+    res.insert("needleBytes", rom.size());
+    res.insert("indexRows", idx.rowCount());
+    res.insert("ms", int(ms));
+    res.insert("count", arr.size());
+    res.insert("matches", arr);
+    r.insert("ok", true);
+    r.insert("result", res);
+    return r;
 }
 
 #endif // RX14_DEBUG_RPC
