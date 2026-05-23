@@ -54,12 +54,15 @@ struct IndexedFile {
     qint64   size = 0;
     qint64   mtime = 0;
     qint64   bytesScanned = 0;
+    int      versionIndex = 0;    // 0 for raw .bin; per-version for .ols/.kp
+    QString  versionLabel;        // e.g. "Original", "Stage 1"
     RomFingerprint fp;
 };
 
 struct SimilarityMatch {
     QString  path;
     qint64   size = 0;
+    QString  versionLabel;        // which .ols version actually matched
     SimilarityScore score;
 };
 
@@ -127,7 +130,8 @@ private:
     std::atomic<bool>     m_paused{false};
 
     bool createSchemaIfNeeded(QSqlDatabase &db, QString *err) const;
-    void upsert(QSqlDatabase &db, const IndexedFile &f) const;
+    // Insert one (file, version) row + its MinHash postings; returns file_id.
+    qint64 insertFile(QSqlDatabase &db, const IndexedFile &f) const;
     static QStringList enumerate(const QStringList &roots);
 };
 

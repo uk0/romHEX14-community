@@ -47,55 +47,50 @@ namespace {
 //
 // Fallback: if the OLS parse fails, hash the raw bytes (better than
 // dropping the file entirely; a corrupted .ols still has *some* signal).
-RomFingerprint hashOne(const QString &path)
+// Fingerprint a file as one row PER VERSION (not a merged "union" sketch).
+// Separate per-version records give the query an honest, precise score and
+// let it report which version actually matched (also helps Catalog Tune
+// Suggestions).  Raw .bin/.ori → a single version (index 0, empty label).
+QList<IndexedFile> hashAllVersions(const QString &path)
 {
+    QList<IndexedFile> out;
     QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return {};
+    if (!f.open(QIODevice::ReadOnly)) return out;
     constexpr qint64 kMaxRead = 64 * 1024 * 1024;     // 64 MB cap (.ols can grow)
     QByteArray fileData = f.read(kMaxRead);
     f.close();
-    if (fileData.size() < 4096) return {};
+    if (fileData.size() < 4096) return out;
+
+    QFileInfo fi(path);
+    const qint64 size  = fi.size();
+    const qint64 mtime = fi.lastModified().toSecsSinceEpoch();
+    auto mk = [&](int vi, const QString &label, const RomFingerprint &fp) {
+        IndexedFile r;
+        r.path = path; r.size = size; r.mtime = mtime;
+        r.versionIndex = vi; r.versionLabel = label;
+        r.fp = fp; r.bytesScanned = fp.bytesScanned;
+        return r;
+    };
 
     const QString ext = QFileInfo(path).suffix().toLower();
     if (ext == QStringLiteral("ols") || ext == QStringLiteral("kp")) {
         const ols::OlsImportResult res = ols::OlsImporter::importFromBytes(fileData);
         if (res.error.isEmpty() && !res.versions.isEmpty()) {
-            // Compute fingerprint for each version and merge bucket-by-bucket
-            // (per-bucket min — sketch of union of all versions' shingles).
-            RomFingerprint merged;
-            merged.wholeFile = QList<quint64>(kMinHashK, 0);
-            merged.dataArea  = QList<quint64>(kMinHashK, 0);
-            qint64 maxScanned = 0;
-            int versionsScored = 0;
+            int vi = 0;
             for (const auto &v : res.versions) {
-                if (v.romData.size() < kShingleSize) continue;
-                const RomFingerprint vfp = fingerprint(QByteArrayView(v.romData));
-                if (vfp.isEmpty()) continue;
-                ++versionsScored;
-                maxScanned = std::max(maxScanned, vfp.bytesScanned);
-                for (int i = 0; i < kMinHashK; ++i) {
-                    if (i < vfp.wholeFile.size()) {
-                        const quint64 hh = vfp.wholeFile[i];
-                        if (hh != 0 && (merged.wholeFile[i] == 0 ||
-                                        hh < merged.wholeFile[i]))
-                            merged.wholeFile[i] = hh;
-                    }
-                    if (i < vfp.dataArea.size()) {
-                        const quint64 hh = vfp.dataArea[i];
-                        if (hh != 0 && (merged.dataArea[i] == 0 ||
-                                        hh < merged.dataArea[i]))
-                            merged.dataArea[i] = hh;
-                    }
+                if (v.romData.size() >= kShingleSize) {
+                    const RomFingerprint fp = fingerprint(QByteArrayView(v.romData));
+                    if (!fp.isEmpty()) out.append(mk(vi, v.name, fp));
                 }
+                ++vi;
             }
-            if (versionsScored > 0) {
-                merged.bytesScanned = maxScanned;
-                return merged;
-            }
+            if (!out.isEmpty()) return out;
         }
         // Parse failed — fall through to raw-bytes fingerprint.
     }
-    return fingerprint(QByteArrayView(fileData));
+    const RomFingerprint fp = fingerprint(QByteArrayView(fileData));
+    if (!fp.isEmpty()) out.append(mk(0, QString(), fp));
+    return out;
 }
 
 }  // namespace
@@ -154,21 +149,31 @@ void SimilarityIndex::close()
 bool SimilarityIndex::createSchemaIfNeeded(QSqlDatabase &db, QString *err) const
 {
     QSqlQuery q(db);
-    if (!q.exec(QStringLiteral(
-            "CREATE TABLE IF NOT EXISTS files ("
-            "  path          TEXT PRIMARY KEY,"
-            "  size          INTEGER,"
-            "  mtime         INTEGER,"
-            "  bytes_scanned INTEGER,"
-            "  blob          BLOB)"))) {
-        if (err) *err = q.lastError().text();
-        return false;
+    // One row PER (file, version).  `postings` is the inverted MinHash index
+    // (one row per non-empty bucket hash) so findSimilar() only touches
+    // candidates that actually share a min-hash with the needle.
+    const char *ddl[] = {
+        "CREATE TABLE IF NOT EXISTS files ("
+        "  file_id       INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  path          TEXT,"
+        "  version_index INTEGER,"
+        "  version_label TEXT,"
+        "  size          INTEGER,"
+        "  mtime         INTEGER,"
+        "  bytes_scanned INTEGER,"
+        "  blob          BLOB)",
+        "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)",
+        "CREATE TABLE IF NOT EXISTS postings (hash INTEGER, file_id INTEGER)",
+        "CREATE INDEX IF NOT EXISTS idx_postings_hash ON postings(hash)",
+    };
+    for (const char *s : ddl) {
+        if (!q.exec(QLatin1String(s))) {
+            if (err) *err = q.lastError().text();
+            return false;
+        }
     }
-    // Speed-up & journal mode for batched writes.
     q.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
     q.exec(QStringLiteral("PRAGMA synchronous=NORMAL"));
-    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_files_size "
-                          "ON files(size)"));
     return true;
 }
 
@@ -182,20 +187,32 @@ int SimilarityIndex::rowCount() const
     return 0;
 }
 
-void SimilarityIndex::upsert(QSqlDatabase &db, const IndexedFile &f) const
+qint64 SimilarityIndex::insertFile(QSqlDatabase &db, const IndexedFile &f) const
 {
     QSqlQuery q(db);
     q.prepare(QStringLiteral(
-        "INSERT INTO files(path,size,mtime,bytes_scanned,blob) "
-        "VALUES(:p,:s,:m,:b,:blob) "
-        "ON CONFLICT(path) DO UPDATE SET "
-        "  size=:s, mtime=:m, bytes_scanned=:b, blob=:blob"));
-    q.bindValue(QStringLiteral(":p"),    f.path);
-    q.bindValue(QStringLiteral(":s"),    f.size);
-    q.bindValue(QStringLiteral(":m"),    f.mtime);
-    q.bindValue(QStringLiteral(":b"),    f.bytesScanned);
-    q.bindValue(QStringLiteral(":blob"), f.fp.toBlob());
-    q.exec();
+        "INSERT INTO files(path,version_index,version_label,size,mtime,"
+        "bytes_scanned,blob) VALUES(?,?,?,?,?,?,?)"));
+    q.addBindValue(f.path);
+    q.addBindValue(f.versionIndex);
+    q.addBindValue(f.versionLabel);
+    q.addBindValue(f.size);
+    q.addBindValue(f.mtime);
+    q.addBindValue(f.bytesScanned);
+    q.addBindValue(f.fp.toBlob());
+    if (!q.exec()) return -1;
+    const qint64 fid = q.lastInsertId().toLongLong();
+
+    // Inverted index: one posting per non-empty MinHash bucket.
+    QSqlQuery p(db);
+    p.prepare(QStringLiteral("INSERT INTO postings(hash,file_id) VALUES(?,?)"));
+    for (quint64 h : f.fp.wholeFile) {
+        if (h == 0) continue;   // empty bucket sentinel
+        p.bindValue(0, QVariant::fromValue<qulonglong>(h));
+        p.bindValue(1, fid);
+        p.exec();
+    }
+    return fid;
 }
 
 QStringList SimilarityIndex::enumerate(const QStringList &roots)
@@ -265,12 +282,15 @@ void SimilarityIndex::rebuild(const QStringList &roots)
     {
         QSqlQuery q(db);
         if (q.exec(QStringLiteral(
-                "DELETE FROM files WHERE SUBSTR(blob,1,4) != 'RFP3'"))) {
+                "DELETE FROM files WHERE SUBSTR(blob,1,4) != 'RFP4'"))) {
             const int purged = q.numRowsAffected();
             if (purged > 0)
                 qWarning("SimilarityIndex: purged %d rows in old fingerprint "
                          "format — they will be re-fingerprinted now.", purged);
         }
+        // Drop postings orphaned by the purge (or any prior crash).
+        q.exec(QStringLiteral(
+            "DELETE FROM postings WHERE file_id NOT IN (SELECT file_id FROM files)"));
     }
 
     // Pre-load existing path → (size,mtime) into memory for O(1)
@@ -326,44 +346,48 @@ void SimilarityIndex::rebuild(const QStringList &roots)
     db.transaction();
     int batchInTx = 0;
 
+    // Reused across the loop (prepared statements persist across commits).
+    QSqlQuery delP(db);
+    delP.prepare(QStringLiteral(
+        "DELETE FROM postings WHERE file_id IN "
+        "(SELECT file_id FROM files WHERE path=?)"));
+    QSqlQuery delF(db);
+    delF.prepare(QStringLiteral("DELETE FROM files WHERE path=?"));
+
     for (int i = 0; i < fresh.size(); i += kChunkSize) {
         while (m_paused.load()) QThread::msleep(50);
         if (m_cancel.load()) break;
 
-        QStringList chunk = fresh.mid(i, kChunkSize);
+        const QStringList chunk = fresh.mid(i, kChunkSize);
 
-        // Fingerprint this chunk in parallel across the global thread
-        // pool.  Returns once every result is ready.
-        QList<IndexedFile> results =
-            QtConcurrent::blockingMapped<QList<IndexedFile>>(
+        // Fingerprint this chunk in parallel — each path yields one row per
+        // version.  Returns once every result is ready.
+        const QList<QList<IndexedFile>> results =
+            QtConcurrent::blockingMapped<QList<QList<IndexedFile>>>(
                 chunk,
-                [](const QString &path) -> IndexedFile {
-                    IndexedFile f;
-                    f.path  = path;
-                    QFileInfo fi(path);
-                    f.size  = fi.size();
-                    f.mtime = fi.lastModified().toSecsSinceEpoch();
-                    f.fp    = hashOne(path);
-                    f.bytesScanned = f.fp.bytesScanned;
-                    return f;
-                });
+                [](const QString &path) { return hashAllVersions(path); });
 
-        // Serial SQLite write.  Per-file commits would dominate, so we
-        // keep one open transaction and commit every kCommitEvery
-        // upserts to bound recovery on crash.
-        for (const IndexedFile &f : results) {
-            if (!f.fp.isEmpty()) {
-                upsert(db, f);
-                ++batchInTx;
-            }
+        // Serial SQLite write: replace each path's rows, insert versions +
+        // postings, commit in batches to bound crash recovery.
+        for (const QList<IndexedFile> &versions : results) {
             ++processed;
-            totalBytes += f.size;
+            QString curPath;
+            if (!versions.isEmpty()) {
+                curPath = versions.first().path;
+                totalBytes += versions.first().size;
+                delP.bindValue(0, curPath); delP.exec();
+                delF.bindValue(0, curPath); delF.exec();
+                for (const IndexedFile &f : versions) {
+                    insertFile(db, f);
+                    ++batchInTx;
+                }
+            }
             if (batchInTx >= kCommitEvery) {
                 db.commit();
                 db.transaction();
                 batchInTx = 0;
             }
-            emit progress(processed, total, totalBytes, wall.elapsed(), f.path);
+            emit progress(processed, total, totalBytes, wall.elapsed(), curPath);
         }
     }
     db.commit();
@@ -381,12 +405,18 @@ QVector<SimilarityMatch> SimilarityIndex::findSimilar(
     QVector<SimilarityMatch> out;
     if (!m_open || needle.isEmpty()) return out;
 
+    // Needle's non-empty MinHash bucket values.
+    QVector<qulonglong> hashes;
+    for (quint64 h : needle.wholeFile) if (h != 0) hashes.append(h);
+    if (hashes.isEmpty()) return out;
+
     const bool onWorker = (QThread::currentThread() != qApp->thread());
     const QString connName = onWorker
         ? m_connectionName + QStringLiteral("_query_") +
           QString::number(reinterpret_cast<quintptr>(QThread::currentThread()), 16)
         : m_connectionName;
 
+    QHash<QString, SimilarityMatch> bestByPath;   // dedup .ols versions by file
     {
         QSqlDatabase db;
         if (onWorker) {
@@ -400,34 +430,59 @@ QVector<SimilarityMatch> SimilarityIndex::findSimilar(
             db = QSqlDatabase::database(m_connectionName);
         }
 
-        QSqlQuery q(db);
-        q.setForwardOnly(true);
-        q.exec(QStringLiteral("SELECT path,size,blob FROM files"));
+        // 1. Inverted index: candidates that share ≥1 min-hash with the
+        //    needle, ranked by shared-hash count (most similar first).  Only
+        //    these get loaded + scored — not the whole table.
+        QStringList ph;
+        ph.reserve(hashes.size());
+        for (int i = 0; i < hashes.size(); ++i) ph << QStringLiteral("?");
+        QVector<qint64> cands;
+        {
+            QSqlQuery q(db);
+            q.setForwardOnly(true);
+            q.prepare(QStringLiteral(
+                "SELECT file_id, COUNT(*) c FROM postings WHERE hash IN (%1) "
+                "GROUP BY file_id ORDER BY c DESC LIMIT 6000")
+                    .arg(ph.join(QLatin1Char(','))));
+            for (qulonglong h : hashes) q.addBindValue(QVariant::fromValue(h));
+            if (q.exec()) while (q.next()) cands.append(q.value(0).toLongLong());
+        }
 
+        // 2. Exact score of each candidate (load only its blob); keep the
+        //    best-scoring version per file path.
         const double threshold = double(minPercent) / 100.0;
-        while (q.next()) {
-            const QByteArray blob = q.value(2).toByteArray();
-            if (blob.isEmpty()) continue;
-            const RomFingerprint fp = RomFingerprint::fromBlob(blob);
+        QSqlQuery r(db);
+        r.setForwardOnly(true);
+        r.prepare(QStringLiteral(
+            "SELECT path,size,version_label,blob FROM files WHERE file_id=?"));
+        for (qint64 fid : cands) {
+            r.bindValue(0, fid);
+            if (!r.exec() || !r.next()) continue;
+            const RomFingerprint fp = RomFingerprint::fromBlob(r.value(3).toByteArray());
             const SimilarityScore s = winols::similarity(needle, fp);
-            if (s.wholeFile < threshold) continue;
-            SimilarityMatch m;
-            m.path  = q.value(0).toString();
-            m.size  = q.value(1).toLongLong();
-            m.score = s;
-            out.append(m);
+            if (s.best() < threshold) continue;
+            const QString path = r.value(0).toString();
+            auto it = bestByPath.find(path);
+            if (it == bestByPath.end() || s.best() > it.value().score.best()) {
+                SimilarityMatch m;
+                m.path         = path;
+                m.size         = r.value(1).toLongLong();
+                m.versionLabel = r.value(2).toString();
+                m.score        = s;
+                bestByPath.insert(path, m);
+            }
         }
         if (onWorker) db.close();
     }
-
     if (onWorker)
         QSqlDatabase::removeDatabase(connName);
 
+    out.reserve(bestByPath.size());
+    for (auto it = bestByPath.constBegin(); it != bestByPath.constEnd(); ++it)
+        out.append(it.value());
     std::sort(out.begin(), out.end(),
               [](const SimilarityMatch &a, const SimilarityMatch &b) {
-                  const double ra = 3 * a.score.wholeFile + a.score.dataArea;
-                  const double rb = 3 * b.score.wholeFile + b.score.dataArea;
-                  return ra > rb;
+                  return a.score.best() > b.score.best();
               });
     if (out.size() > limit) out.resize(limit);
     return out;
