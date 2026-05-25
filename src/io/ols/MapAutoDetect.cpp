@@ -246,6 +246,76 @@ static double scoreCombined(double axisScore, double smooth, int cellPenalty)
     return s;
 }
 
+static bool isCommon2DShape(int n, int m)
+{
+    if (n > m) std::swap(n, m);
+    struct Shape { int n; int m; };
+    // Small priors from the local KP corpus; they should rank, not decide.
+    constexpr Shape shapes[] = {
+        {6, 16}, {8, 8}, {16, 16}, {12, 16}, {9, 16},
+        {8, 16}, {10, 12}, {14, 16}, {10, 16}, {10, 10},
+        {8, 11}, {13, 16}, {11, 16}, {5, 9},
+        {15, 16}, {10, 14}, {5, 12}, {8, 12}, {9, 12},
+        {6, 12}, {6, 8}, {8, 9}
+    };
+    for (const Shape &s : shapes) {
+        if (s.n == n && s.m == m)
+            return true;
+    }
+    return false;
+}
+
+static double scoreShapePrior2D(int n, int m)
+{
+    const int minDim = std::min(n, m);
+    const int maxDim = std::max(n, m);
+    const int area = n * m;
+    double s = 0.0;
+
+    if (isCommon2DShape(n, m)) s += 6.0;
+    if (maxDim >= 12 && minDim >= 5) s += 4.0;
+    if (minDim >= 8 && maxDim <= 32) s += 3.0;
+    if (n == 16 || m == 16) s += 2.0;
+
+    if (area < 48) s -= 18.0;
+    else if (area < 64) s -= 10.0;
+
+    if (maxDim <= 7 && minDim <= 7) s -= 18.0;
+    else if (maxDim <= 8 && minDim <= 6) s -= 12.0;
+
+    return s;
+}
+
+static double scoreShapePrior1D(int n)
+{
+    double s = 0.0;
+    if (n == 8 || n == 10 || n == 12 || n == 14 || n == 16) s += 4.0;
+    else if (n >= 8 && n <= 32) s += 2.0;
+    if (n < 8) s -= 8.0;
+    return s;
+}
+
+static double scoreCellPrior(int dataCellBytes, int axisCellBytes)
+{
+    double s = 0.0;
+    if (dataCellBytes == 2) s += 3.0;
+    else if (dataCellBytes == 1) s -= 5.0;
+    else if (dataCellBytes == 4) s -= 12.0;
+    if (dataCellBytes == axisCellBytes) s += 1.0;
+    return s;
+}
+
+static double scoreWithPriors(double baseScore, double prior)
+{
+    double score = baseScore;
+    if (prior > 0.0) {
+        score += prior * std::max(0.0, 100.0 - baseScore) / 40.0;
+    } else {
+        score += prior;
+    }
+    return std::clamp(score, 0.0, 100.0);
+}
+
 } // namespace
 
 
@@ -256,7 +326,7 @@ QVector<MapCandidate> MapAutoDetect::scan(const QByteArray &rom,
     QVector<MapCandidate> result;
     if (rom.size() < 64) return result;
 
-    constexpr int kMinAxisLen = 5;
+    constexpr int kMinAxisLen = 8;
     constexpr int kMaxAxisLen = 96;
     constexpr int kMaxPairGap = 256;
 
@@ -292,7 +362,11 @@ QVector<MapCandidate> MapAutoDetect::scan(const QByteArray &rom,
         if (smooth <= 0) return;
         const double axMean = (ax.score + ay.score) * 0.5;
         const int cellPen = (dataCellBytes == ax.cellBytes) ? 0 : 5;
-        const double total = scoreCombined(axMean, smooth, cellPen);
+        const double baseScore = scoreCombined(axMean, smooth, cellPen);
+        const double prior = scoreShapePrior2D(N, M)
+            + scoreCellPrior(dataCellBytes, ax.cellBytes);
+        const double total = scoreWithPriors(
+            baseScore, prior);
         if (total < opts.minScore2D) return;
 
         MapCandidate c;
@@ -326,7 +400,11 @@ QVector<MapCandidate> MapAutoDetect::scan(const QByteArray &rom,
                                                      ax.bigEndian, false);
         if (smooth <= 0) return;
         const int cellPen = (dataCellBytes == ax.cellBytes) ? 0 : 5;
-        const double total = scoreCombined(ax.score, smooth, cellPen);
+        const double baseScore = scoreCombined(ax.score, smooth, cellPen);
+        const double prior = scoreShapePrior1D(N)
+            + scoreCellPrior(dataCellBytes, ax.cellBytes);
+        const double total = scoreWithPriors(
+            baseScore, prior);
         if (total < opts.minScore1D) return;
 
         MapCandidate c;
