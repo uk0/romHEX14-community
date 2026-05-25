@@ -9,6 +9,7 @@
 #include "ZipDecompressor.h"
 
 #include <QtEndian>
+#include <QFileInfo>
 #include <cstring>
 
 namespace ols {
@@ -142,92 +143,27 @@ KpImportResult KpImporter::importFromBytes(const QByteArray &fileData,
                 .arg(uncompressedSize));
     }
 
-    auto findMaps = [&result, baseAddress](const QByteArray &payload) {
-        QVector<MapInfo> maps;
-        if (payload.size() < 14) {
-            result.warnings.append(KpImporter::tr(
-                "intern payload too small (%1 bytes)").arg(payload.size()));
-            return maps;
-        }
-        const auto *p = reinterpret_cast<const uchar *>(payload.constData());
-        const uint32_t mapCount = qFromLittleEndian<uint32_t>(p + 1);
-        if (mapCount == 0 || mapCount > 100000) {
-            result.warnings.append(KpImporter::tr(
-                "intern payload map count %1 out of range").arg(mapCount));
-            return maps;
-        }
-        QVector<int> mapStarts;
-        int pos = 14;
-        const int sz = payload.size();
-        while (pos < sz - 4 && mapStarts.size() < int(mapCount)) {
-            const uint32_t cl = qFromLittleEndian<uint32_t>(p + pos);
-            if (cl >= 5 && cl < 200 && pos + 4 + int(cl) <= sz) {
-                int printable = 0;
-                bool hasSpace = false;
-                for (uint32_t i = 0; i < cl; ++i) {
-                    uint8_t b = p[pos + 4 + i];
-                    if ((b >= 0x20 && b < 0x7F) || b >= 0xA0) ++printable;
-                    if (b == ' ') hasSpace = true;
-                }
-                if (printable >= int(cl) - 1 && hasSpace) {
-                    mapStarts.append(pos);
-                    pos += 4 + int(cl);
-                    continue;
-                }
-            }
-            ++pos;
-        }
-        maps.reserve(mapStarts.size());
-        for (int idx = 0; idx < mapStarts.size(); ++idx) {
-            const int start = mapStarts[idx];
-            const uint32_t cl = qFromLittleEndian<uint32_t>(p + start);
-            QByteArray commentBytes = payload.mid(start + 4, int(cl));
-            QString comment = QString::fromLatin1(commentBytes).trimmed();
-            const int metaOff = start + 4 + int(cl);
-            const int nextEnd = (idx + 1 < mapStarts.size())
-                                  ? (mapStarts[idx + 1] - 5) : sz;
-            const int metaLen = qMax(0, nextEnd - metaOff);
-
-            MapInfo m;
-            m.name           = comment;
-            m.description    = comment;
-            m.type           = QStringLiteral("MAP");
-            m.dimensions.x   = 1;
-            m.dimensions.y   = 1;
-            m.dataSize       = 2;
-            m.length         = m.dimensions.x * m.dimensions.y * m.dataSize;
-            m.rawAddress     = baseAddress;
-            m.address        = 0;
-            m.linkConfidence = 60;
-
-            if (metaLen >= 16) {
-                const auto *mp = reinterpret_cast<const uchar *>(
-                    payload.constData() + metaOff);
-                for (int off : {0, 4, 8, 12}) {
-                    uint16_t a = qFromLittleEndian<uint16_t>(mp + off);
-                    uint16_t b = qFromLittleEndian<uint16_t>(mp + off + 2);
-                    if (a >= 1 && a <= 256 && b >= 1 && b <= 256
-                        && (a > 1 || b > 1)) {
-                        m.dimensions.x = a;
-                        m.dimensions.y = b;
-                        m.length = m.dimensions.x * m.dimensions.y * m.dataSize;
-                        if (a == 1 || b == 1) m.type = QStringLiteral("CURVE");
-                        break;
-                    }
-                }
-            }
-            maps.append(m);
-        }
-        if (maps.size() != int(mapCount)) {
-            result.warnings.append(KpImporter::tr(
-                "intern map_count = %1 but parser found %2 records")
-                    .arg(mapCount).arg(maps.size()));
-        }
-        return maps;
-    };
-
-    result.maps = findMaps(intern);
+    // Route the intern payload through OlsKennfeldParser — the same
+    // schema-aware parser used for .ols imports.  RE'd via WinOLS's
+    // sub_7FF72E82DEA0 (TaggedName serialiser, IDA 0x7FF72E82DEA0):
+    // .kp intern records share the .ols intern record layout except that
+    // the identifier-name cstring is empty (the human-readable name lives
+    // in the earlier comment field).  parseOne tolerates that case — see
+    // its matching change in OlsKennfeldParser::parseOne (issue #18).
+    const int schema = static_cast<int>(result.formatVersion);
+    result.maps = OlsKennfeldParser::parseIntern(intern, schema, &result.warnings);
     result.mapCount = static_cast<uint32_t>(result.maps.size());
+
+    // Rebase ROM addresses to project file offsets if requested. parseIntern
+    // stores rawAddress as it appears in the file; callers with a project
+    // baseAddress get the file offset in m.address.
+    if (baseAddress != 0) {
+        for (auto &m : result.maps) {
+            m.address = (m.rawAddress >= baseAddress)
+                            ? m.rawAddress - baseAddress
+                            : m.rawAddress;
+        }
+    }
 
     return result;
 }

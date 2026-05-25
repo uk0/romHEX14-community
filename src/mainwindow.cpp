@@ -4153,6 +4153,85 @@ void MainWindow::actImportKP()
         return;
     }
 
+    // ── Folder grouping ──────────────────────────────────────────────────
+    //
+    // The .kp wire format does not carry per-map folder info — verified
+    // against the user's BMW E60 sample (every record has cfr-breadcrumb
+    // count = 0).  WinOLS displays folders by inferring them from name
+    // prefixes; we do the same here so the project tree groups maps
+    // sensibly instead of dumping all 100+ of them flat under "My maps".
+    //
+    // Heuristic: split each map name into tokens, normalise the first
+    // alphabetic token to lower-case as the bucket key, then promote the
+    // most common original casing as the display name.  Singletons go
+    // into an "Other" bucket.
+    {
+        QHash<QString, QStringList>    bucketsCanonical;   // key → ordered names
+        QHash<QString, QHash<QString,int>> bucketDisplays; // key → (display→count)
+
+        auto firstToken = [](const QString &s) -> QString {
+            for (int i = 0; i < s.size(); ++i) {
+                if (!s[i].isLetter()) {
+                    return s.left(i);
+                }
+            }
+            return s;
+        };
+
+        for (const auto &m : proj->maps) {
+            const QString first = firstToken(m.name).trimmed();
+            const QString key = first.isEmpty() ? QStringLiteral("__other__")
+                                                : first.toLower();
+            bucketsCanonical[key].append(m.name);
+            if (!first.isEmpty())
+                ++bucketDisplays[key][first];
+        }
+
+        // Promote ≥2-member buckets to real groups; merge singletons into
+        // "Other".  Display name = the most-common original casing for
+        // that bucket (so "Llambda" + "Lambda" both fall under "Lambda"
+        // when "Lambda" outnumbers it).
+        QStringList singletons;
+        QVector<A2LGroup> groups;
+        for (auto it = bucketsCanonical.constBegin();
+             it != bucketsCanonical.constEnd(); ++it) {
+            const QString &key = it.key();
+            const QStringList &names = it.value();
+            if (key == QStringLiteral("__other__") || names.size() < 2) {
+                singletons += names;
+                continue;
+            }
+            const auto &displays = bucketDisplays[key];
+            QString best = key;
+            int bestCount = 0;
+            for (auto dit = displays.constBegin(); dit != displays.constEnd(); ++dit) {
+                if (dit.value() > bestCount) {
+                    bestCount = dit.value();
+                    best = dit.key();
+                }
+            }
+            A2LGroup g;
+            g.name = best;
+            g.characteristics = names;
+            groups.append(std::move(g));
+        }
+        std::sort(groups.begin(), groups.end(),
+                  [](const A2LGroup &a, const A2LGroup &b) {
+                      return a.name.toLower() < b.name.toLower();
+                  });
+        if (!singletons.isEmpty()) {
+            A2LGroup other;
+            other.name = tr("Other");
+            std::sort(singletons.begin(), singletons.end(),
+                      [](const QString &a, const QString &b) {
+                          return a.toLower() < b.toLower();
+                      });
+            other.characteristics = singletons;
+            groups.append(std::move(other));
+        }
+        proj->groups = std::move(groups);
+    }
+
     proj->modified = true;
     emit proj->dataChanged();   // tree refresh + autosave
 
