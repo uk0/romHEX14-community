@@ -4140,10 +4140,13 @@ void MainWindow::actImportKP()
         existing.insert({m.name, m.address});
 
     int added = 0, skipped = 0;
+    QStringList addedNames;
+    addedNames.reserve(result.maps.size());
     for (const auto &m : result.maps) {
         if (existing.contains({m.name, m.address})) { ++skipped; continue; }
         proj->maps.append(m);
         existing.insert({m.name, m.address});
+        addedNames.append(m.name);
         ++added;
     }
 
@@ -4154,46 +4157,42 @@ void MainWindow::actImportKP()
         return;
     }
 
-    // ── Folder grouping ──────────────────────────────────────────────────
+    // ── Folder grouping for KP-imported maps ─────────────────────────────
     //
-    // The .kp wire format does not carry per-map folder info — verified
-    // against the user's BMW E60 sample (every record has cfr-breadcrumb
-    // count = 0).  WinOLS displays folders by inferring them from name
-    // prefixes; we do the same here so the project tree groups maps
-    // sensibly instead of dumping all 100+ of them flat under "My maps".
-    //
-    // Heuristic: split each map name into tokens, normalise the first
-    // alphabetic token to lower-case as the bucket key, then promote the
-    // most common original casing as the display name.  Singletons go
-    // into an "Other" bucket.
-    {
-        QHash<QString, QStringList>    bucketsCanonical;   // key → ordered names
-        QHash<QString, QHash<QString,int>> bucketDisplays; // key → (display→count)
+    // The .kp wire format does not carry per-map folder info, so we derive
+    // groups heuristically by name prefix.  Scope is the newly-imported KP
+    // maps only — existing proj->groups (from a prior A2L/OLS import) are
+    // preserved and we append new buckets to them rather than replacing
+    // the whole list.  Issue #23.
+    if (!addedNames.isEmpty()) {
+        QHash<QString, QStringList>        bucketsCanonical;   // key → names
+        QHash<QString, QHash<QString,int>> bucketDisplays;     // key → (display→count)
 
         auto firstToken = [](const QString &s) -> QString {
             for (int i = 0; i < s.size(); ++i) {
-                if (!s[i].isLetter()) {
+                if (!s[i].isLetter())
                     return s.left(i);
-                }
             }
             return s;
         };
 
-        for (const auto &m : proj->maps) {
-            const QString first = firstToken(m.name).trimmed();
+        for (const QString &name : addedNames) {
+            const QString first = firstToken(name).trimmed();
             const QString key = first.isEmpty() ? QStringLiteral("__other__")
                                                 : first.toLower();
-            bucketsCanonical[key].append(m.name);
+            bucketsCanonical[key].append(name);
             if (!first.isEmpty())
                 ++bucketDisplays[key][first];
         }
 
-        // Promote ≥2-member buckets to real groups; merge singletons into
-        // "Other".  Display name = the most-common original casing for
-        // that bucket (so "Llambda" + "Lambda" both fall under "Lambda"
-        // when "Lambda" outnumbers it).
+        // Skip group names that already exist in proj->groups so a second KP
+        // import doesn't shadow / duplicate buckets the user already has.
+        QSet<QString> existingGroupNames;
+        for (const auto &g : proj->groups)
+            existingGroupNames.insert(g.name.toLower());
+
         QStringList singletons;
-        QVector<A2LGroup> groups;
+        QVector<A2LGroup> newGroups;
         for (auto it = bucketsCanonical.constBegin();
              it != bucketsCanonical.constEnd(); ++it) {
             const QString &key = it.key();
@@ -4211,26 +4210,43 @@ void MainWindow::actImportKP()
                     best = dit.key();
                 }
             }
+            if (existingGroupNames.contains(best.toLower())) {
+                singletons += names;
+                continue;
+            }
             A2LGroup g;
             g.name = best;
             g.characteristics = names;
-            groups.append(std::move(g));
+            newGroups.append(std::move(g));
         }
-        std::sort(groups.begin(), groups.end(),
+        std::sort(newGroups.begin(), newGroups.end(),
                   [](const A2LGroup &a, const A2LGroup &b) {
                       return a.name.toLower() < b.name.toLower();
                   });
         if (!singletons.isEmpty()) {
-            A2LGroup other;
-            other.name = tr("Other");
             std::sort(singletons.begin(), singletons.end(),
                       [](const QString &a, const QString &b) {
                           return a.toLower() < b.toLower();
                       });
-            other.characteristics = singletons;
-            groups.append(std::move(other));
+            // Append singletons to existing "Other" if one is already there,
+            // otherwise create a fresh "Other" bucket.
+            A2LGroup *otherGroup = nullptr;
+            for (auto &g : proj->groups) {
+                if (g.name.compare(tr("Other"), Qt::CaseInsensitive) == 0) {
+                    otherGroup = &g;
+                    break;
+                }
+            }
+            if (otherGroup) {
+                otherGroup->characteristics += singletons;
+            } else {
+                A2LGroup other;
+                other.name = tr("Other");
+                other.characteristics = singletons;
+                newGroups.append(std::move(other));
+            }
         }
-        proj->groups = std::move(groups);
+        proj->groups += newGroups;
     }
 
     proj->modified = true;

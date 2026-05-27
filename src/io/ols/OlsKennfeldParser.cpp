@@ -495,18 +495,8 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
         if (c.remain() < 8) return mi;
         c.u32();
         auto n = c.cstr();
-        if (!n.valid()) return mi;
-        // .ols intern: identifier-style name (n_mot, mlsmw, …) — must pass isIdent.
-        // .kp  intern: identifier left empty; the human-readable name is in the
-        // earlier cfr() comment field instead.  Tolerate either source so the
-        // same parser handles both file types (issue #18).
-        if (n.text.isEmpty()) {
-            name = comment.name;
-        } else if (!isIdent(n.text)) {
-            return mi;
-        } else {
-            name = n.text;
-        }
+        if (!n.valid() || !isIdent(n.text)) return mi;
+        name = n.text;
     } else {
         return mi;
     }
@@ -563,41 +553,6 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
     uint32_t romAddress = c.u32();
     uint32_t romEnd     = c.u32();
     uint32_t universalBase = c.u32();  // a2+644 ("Base Address" / virtual flash end)
-
-    // ── Address-span dim correction (.kp records) ────────────────────────
-    //
-    // .ols intern records put the active map dimensions in (a400, a396) =
-    // (cols, rows) per the MFC CSize convention — classifyDims above gets
-    // those right.  .kp records, written by the same serializer, instead
-    // populate (a276, a280) with the dimensions and leave (a396, a400) as
-    // (cols-1, rows-1) or zero (likely the "used range" indicator).  Same
-    // wire format, different field semantics.
-    //
-    // Use the address span (romEnd - romAddress) as the ground truth: it
-    // gives us totalCells = bytes / dataSize, and we pick the (X,Y) pair
-    // whose product matches.  If neither matches, keep the initial
-    // classifyDims result (preserves .ols behaviour where a276/a280 are
-    // scratch buffers).
-    if (romAddress > 0 && romEnd > romAddress) {
-        const uint32_t byteSpan = romEnd - romAddress;
-        const int dsCandidate = (cellBits == 16 || cellBits == 10) ? 2
-                              : (cellBits == 2) ? 1 : 2;
-        const int totalCells = int(byteSpan) / dsCandidate;
-        if (totalCells > 0) {
-            auto fits = [totalCells](uint32_t x, uint32_t y) -> bool {
-                return x > 0 && y > 0
-                    && x <= 4096 && y <= 4096
-                    && int(x) * int(y) == totalCells;
-            };
-            if (xSize * ySize != totalCells) {
-                if (fits(a276, a280))      { xSize = int(a276); ySize = int(a280); }
-                else if (fits(a400, a396)) { xSize = int(a400); ySize = int(a396); }
-                else if (fits(a276, 1))    { xSize = int(a276); ySize = 1; }
-                else if (fits(1, a280))    { xSize = 1; ySize = int(a280); }
-                else if (fits(totalCells, 1)) { xSize = totalCells; ySize = 1; }
-            }
-        }
-    }
 
     QString physUnit = !unit.text.isEmpty() ? unit.text : label.text;
 
@@ -721,10 +676,7 @@ MapInfo OlsKennfeldParser::parseOne(const QByteArray &data,
                         || (offset < 0);
     }
     mi.linkConfidence = 100;
-    // Bosch ECUs (BMW EDC17, VAG MED17, etc. — the majority of cars in the
-    // wild) store cells ROW-major (y fastest). The previous `true` was
-    // transposing every map for those ECUs. Issue #18.
-    mi.columnMajor = false;
+    mi.columnMajor = true;
 
     if (xSize <= 1 && ySize <= 1)
         mi.type = QStringLiteral("VALUE");
