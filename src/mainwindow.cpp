@@ -2777,11 +2777,12 @@ void MainWindow::retranslateUi()
     // NOTE: parallel agents may also add items to this menu (e.g.
     //       "Auto-detect ECU"). If you're touching this region, leave
     //       this comment marker so commits don't collide.
-#ifdef RX14_PRO_BUILD
     m_menuMisc->addAction(tr("Auto-detect &Maps\u2026"), this,
                           &MainWindow::actAutoDetectMaps);
+#ifdef RX14_PRO_BUILD
     m_menuMisc->addAction(tr("Auto-detect &ECU\u2026"), this,
                           &MainWindow::actAutoDetectEcu);
+#endif
     m_actAutoScanOnLoad = m_menuMisc->addAction(tr("Auto-scan &ROM on import"));
     m_actAutoScanOnLoad->setCheckable(true);
     m_actAutoScanOnLoad->setChecked(
@@ -2790,8 +2791,6 @@ void MainWindow::retranslateUi()
         rx14::appSettings().setValue("autoDetectMapsOnLoad", on);
     });
     m_menuMisc->addSeparator();
-#endif
-
     // Preferences and Command Palette — placed BEFORE submenus
     if (m_actCmdPalette) m_menuMisc->addAction(m_actCmdPalette);
     if (m_actPreferences) m_menuMisc->addAction(m_actPreferences);
@@ -4120,7 +4119,9 @@ void MainWindow::actImportKP()
     const QByteArray data = f.readAll();
     f.close();
 
-    auto result = ols::KpImporter::importFromBytes(data, proj->baseAddress);
+    auto result = ols::KpImporter::importFromBytes(
+        data, proj->baseAddress,
+        static_cast<uint32_t>(qMax(0, proj->currentData.size())));
     if (!result.error.isEmpty()) {
         QMessageBox::critical(this, tr("Import Error"), result.error);
         return;
