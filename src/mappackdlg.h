@@ -30,7 +30,10 @@ public:
                                 QWidget *parent = nullptr);
 
     // Import mode — opens file picker and applies to the current project.
-    static void importPack(Project *project, QWidget *parent = nullptr);
+    // preferCsv preselects the CSV map list filter in the file dialog
+    // (used by the toolbar CSV button).
+    static void importPack(Project *project, QWidget *parent = nullptr,
+                           bool preferCsv = false);
 
     // Internal constructor (use the static factory methods above).
     explicit MapPackDlg(QWidget *parent = nullptr);

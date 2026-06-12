@@ -2003,6 +2003,7 @@ void MainWindow::buildActions()
     m_actCompareRoms     = new QAction(tr("Compare ROM / Version…"),     this);
     m_actCompareHex      = new QAction(tr("Compare Hex…"),                this);
     m_actImportMapPack   = new QAction(tr("Import Map Pack…"),           this);
+    m_actImportCsvList   = new QAction(tr("Import Map List (CSV)…"),     this);
     m_actPatchEditor     = new QAction(tr("Open Patch Script…"),         this);
     m_actDtcManager      = new QAction(tr("DTC Manager (A2L)…"),         this);
     m_actDtcWizard       = new QAction(tr("Cloud Tools (DTC && Features)…"), this);
@@ -2015,6 +2016,7 @@ void MainWindow::buildActions()
     m_actImportLinkedVer->setToolTip(tr("Import a ROM file as a new version snapshot of this project"));
     m_actCompareRoms->setToolTip(tr("Compare current ROM against a linked ROM or saved version"));
     m_actImportMapPack->setToolTip(tr("Import a .rxpack map pack and apply selected maps to the current ROM"));
+    m_actImportCsvList->setToolTip(tr("Import a CSV map list (Address;Name;Size) and add the map definitions to the project"));
     m_actPatchEditor->setToolTip(tr("Open a .rxpatch script file in the patch editor"));
 
     // Window
@@ -2271,6 +2273,15 @@ void MainWindow::buildActions()
     connect(m_actCompareRoms,     &QAction::triggered, this, &MainWindow::actCompareRoms);
     connect(m_actCompareHex,      &QAction::triggered, this, &MainWindow::actCompareHex);
     connect(m_actImportMapPack,   &QAction::triggered, this, &MainWindow::actImportMapPack);
+    connect(m_actImportCsvList,   &QAction::triggered, this, [this]() {
+        Project *proj = activeProject();
+        if (!proj) {
+            QMessageBox::information(this, tr("No project"),
+                tr("Open a project before importing a map list."));
+            return;
+        }
+        MapPackDlg::importPack(proj, this, /*preferCsv=*/true);
+    });
     connect(m_actPatchEditor,     &QAction::triggered, this, &MainWindow::actOpenPatchEditor);
     connect(m_actDtcWizard,      &QAction::triggered, this, [this]() {
         auto *proj = activeProject();
@@ -2436,6 +2447,7 @@ void MainWindow::retranslateUi()
     m_actCompareRoms->setText(tr("Compare ROM / Version…"));
     m_actCompareHex->setText(tr("Compare Hex…"));
     m_actImportMapPack->setText(tr("Import Map Pack…"));
+    m_actImportCsvList->setText(tr("Import Map List (CSV)…"));
     m_actPatchEditor->setText(tr("Open Patch Script…"));
     m_actDtcManager->setText(tr("DTC Manager (A2L)…"));
     m_actDtcWizard->setText(tr("Cloud Tools (DTC && Features)…"));
@@ -2572,6 +2584,7 @@ void MainWindow::retranslateUi()
 #endif
     m_menuProject->addSeparator();
     m_menuProject->addAction(m_actImportMapPack);
+    m_menuProject->addAction(m_actImportCsvList);
     m_menuProject->addAction(m_actPatchEditor);
     m_menuProject->addAction(m_actDtcWizard);
     m_menuProject->addAction(m_actDtcManager);
@@ -2999,6 +3012,7 @@ void MainWindow::buildToolBars()
     m_actImportA2L->setIcon(makeIcon("A2L", cNav));
     m_actImportOLS->setIcon(makeIcon("OLS", cNav));   // toolbar OLS button
     m_actImportKP->setIcon(makeIcon("KP", cNav));
+    m_actImportCsvList->setIcon(makeIcon("CSV", cNav));
     m_actAddVersion->setIcon(makeIcon("V+", cNav));
     m_actExport->setIcon(makeIcon("EXP", cFile));
     m_actTile->setIcon(makeIcon("⊞", cFile));
@@ -3045,6 +3059,7 @@ void MainWindow::buildToolBars()
     tb1->addAction(m_actImportA2L);
     tb1->addAction(m_actImportOLS);   // toolbar OLS button → unified import
     tb1->addAction(m_actImportKP);
+    tb1->addAction(m_actImportCsvList);
     tb1->addAction(m_actAddVersion);
     tb1->addSeparator();
     tb1->addAction(m_actExport);

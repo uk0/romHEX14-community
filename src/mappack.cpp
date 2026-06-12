@@ -7,8 +7,12 @@
 #include "mappack.h"
 #include <QDateTime>
 #include <QFile>
+#include <QFileInfo>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QRegularExpression>
+#include <QTextStream>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -275,6 +279,190 @@ MapPack MapPack::load(const QString &path, QString *error)
     return fromJson(doc, error);
 }
 
+// ── CSV map list (Address;Name;Size) ─────────────────────────────────────────
+//
+// Interchange format used by OLS-style tools for map list exports:
+//
+//     Address;Name;Size
+//     "$29513A";"Map ""Bosch II 16""";"15x16"
+//
+// Size is cols×rows.  Rows without a valid size (e.g. the "Hexdump" entry)
+// are skipped.  A later row with the same address replaces an earlier one —
+// these exports list auto-detected names first and user renames further down.
+
+static QStringList splitCsvLine(const QString &line, QChar sep)
+{
+    QStringList fields;
+    QString cur;
+    bool quoted = false;
+    for (int i = 0; i < line.size(); ++i) {
+        const QChar ch = line.at(i);
+        if (quoted) {
+            if (ch == QLatin1Char('"')) {
+                if (i + 1 < line.size() && line.at(i + 1) == QLatin1Char('"')) {
+                    cur += QLatin1Char('"');
+                    ++i;
+                } else {
+                    quoted = false;
+                }
+            } else {
+                cur += ch;
+            }
+        } else if (ch == QLatin1Char('"')) {
+            quoted = true;
+        } else if (ch == sep) {
+            fields << cur;
+            cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    fields << cur;
+    return fields;
+}
+
+static bool parseCsvAddress(QString s, uint32_t *out)
+{
+    s = s.trimmed();
+    int base = 10;
+    if (s.startsWith(QLatin1Char('$'))) {
+        s.remove(0, 1);
+        base = 16;
+    } else if (s.startsWith(QLatin1String("0x"), Qt::CaseInsensitive)) {
+        s.remove(0, 2);
+        base = 16;
+    }
+    bool ok = false;
+    const uint v = s.toUInt(&ok, base);
+    if (ok) *out = v;
+    return ok;
+}
+
+static bool parseCsvSize(const QString &s, int *cols, int *rows)
+{
+    static const QRegularExpression re(
+        QStringLiteral("^\\s*(\\d+)\\s*[xX×]\\s*(\\d+)\\s*$"));
+    const auto m = re.match(s);
+    if (!m.hasMatch()) return false;
+    *cols = m.captured(1).toInt();
+    *rows = m.captured(2).toInt();
+    return *cols > 0 && *rows > 0 && *cols <= 10000 && *rows <= 10000;
+}
+
+MapPack MapPack::loadCsv(const QString &path, QString *error)
+{
+    MapPack pk;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (error) *error = f.errorString();
+        return pk;
+    }
+
+    const QByteArray raw = f.readAll();
+    QString text = QString::fromUtf8(raw);
+    if (text.contains(QChar::ReplacementCharacter))
+        text = QString::fromLatin1(raw);  // OLS-tool exports are often Latin-1
+
+    static const QRegularExpression newlines(QStringLiteral("[\r\n]+"));
+    const QStringList lines = text.split(newlines, Qt::SkipEmptyParts);
+    if (lines.isEmpty()) {
+        if (error) *error = QStringLiteral("Empty CSV file");
+        return pk;
+    }
+
+    // Header: locate Address/Name/Size columns, detect the delimiter.
+    const QChar sep = lines.first().count(QLatin1Char(';')) > 0
+                      ? QLatin1Char(';') : QLatin1Char(',');
+    const QStringList header = splitCsvLine(lines.first(), sep);
+    int addrCol = -1, nameCol = -1, sizeCol = -1;
+    for (int i = 0; i < header.size(); ++i) {
+        const QString h = header[i].trimmed().toLower();
+        if (h == QLatin1String("address")) addrCol = i;
+        else if (h == QLatin1String("name")) nameCol = i;
+        else if (h == QLatin1String("size")) sizeCol = i;
+    }
+    if (addrCol < 0 || nameCol < 0 || sizeCol < 0) {
+        if (error)
+            *error = QStringLiteral(
+                "CSV header must contain Address, Name and Size columns");
+        return pk;
+    }
+    const int needed = qMax(addrCol, qMax(nameCol, sizeCol)) + 1;
+
+    // Parse rows; a repeated address replaces the earlier entry in place.
+    QHash<uint32_t, int> addrToIndex;
+    for (int li = 1; li < lines.size(); ++li) {
+        const QStringList fields = splitCsvLine(lines[li], sep);
+        if (fields.size() < needed) continue;
+
+        uint32_t addr = 0;
+        int cols = 0, rows = 0;
+        if (!parseCsvAddress(fields[addrCol], &addr)) continue;
+        if (!parseCsvSize(fields[sizeCol], &cols, &rows)) continue;
+
+        MapPackEntry e;
+        e.name    = fields[nameCol].trimmed();
+        e.cols    = cols;
+        e.rows    = rows;
+        e.address = addr;
+        if (e.name.isEmpty()) continue;
+        // dataSize/endianness are not in the format; keep struct defaults.
+        // data stays empty: this entry defines a map, it carries no bytes.
+
+        const auto it = addrToIndex.constFind(addr);
+        if (it != addrToIndex.constEnd()) {
+            pk.maps[it.value()] = e;
+        } else {
+            addrToIndex.insert(addr, pk.maps.size());
+            pk.maps.append(e);
+        }
+    }
+
+    // The project map list is keyed by name, so duplicates (a dozen "N75"
+    // curves at different addresses) must be disambiguated.  Suffix every
+    // occurrence of a repeated name with its address and keep the original
+    // in the description.
+    QHash<QString, int> nameCount;
+    for (const MapPackEntry &e : pk.maps)
+        ++nameCount[e.name];
+    for (MapPackEntry &e : pk.maps) {
+        if (nameCount.value(e.name) < 2) continue;
+        e.description = e.name;
+        e.name += QStringLiteral(" [$%1]").arg(
+            QString::number(e.address, 16).toUpper());
+    }
+
+    if (pk.maps.isEmpty()) {
+        if (error) *error = QStringLiteral("No map definitions found in the CSV file");
+        return pk;
+    }
+
+    pk.created = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    pk.label   = QFileInfo(path).completeBaseName();
+    return pk;
+}
+
+bool MapPack::saveCsv(const QString &path, QString *error) const
+{
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        if (error) *error = f.errorString();
+        return false;
+    }
+    QTextStream ts(&f);
+    ts << "Address;Name;Size\n";
+    for (const MapPackEntry &e : maps) {
+        QString name = e.name;
+        name.replace(QLatin1Char('"'), QLatin1String("\"\""));
+        ts << QStringLiteral("\"$%1\";\"%2\";\"%3x%4\"\n")
+              .arg(QString::number(e.address, 16).toUpper().rightJustified(6, QLatin1Char('0')),
+                   name,
+                   QString::number(e.cols),
+                   QString::number(e.rows));
+    }
+    return true;
+}
+
 // ── Apply ─────────────────────────────────────────────────────────────────────
 
 QStringList MapPack::apply(QByteArray &rom,
@@ -286,6 +474,9 @@ QStringList MapPack::apply(QByteArray &rom,
     int romLen = rom.size();
 
     for (const MapPackEntry &e : maps) {
+        if (e.data.isEmpty())
+            continue;  // definition-only entry (CSV map list): nothing to write
+
         const MapInfo *mi = nullptr;
         for (const MapInfo &m : projectMaps)
             if (m.name == e.name) { mi = &m; break; }

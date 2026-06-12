@@ -388,6 +388,7 @@ private:
     QAction *m_actCompareRoms     = nullptr;
     QAction *m_actCompareHex      = nullptr;
     QAction *m_actImportMapPack   = nullptr;
+    QAction *m_actImportCsvList   = nullptr;  // toolbar CSV map list import
     QAction *m_actPatchEditor     = nullptr;
     QAction *m_actDtcManager      = nullptr;
     QAction *m_actDtcWizard       = nullptr;

@@ -64,15 +64,31 @@ void MapPackDlg::exportFromDiffs(const QVector<MapDiff> &diffs,
     dlg->show();
 }
 
-void MapPackDlg::importPack(Project *project, QWidget *parent)
+// True when no entry carries cell data — e.g. a pack parsed from a CSV map
+// list.  Applying such a pack only registers map definitions in the project.
+static bool isDefinitionOnly(const MapPack &pack)
 {
+    for (const MapPackEntry &e : pack.maps)
+        if (!e.data.isEmpty()) return false;
+    return !pack.maps.isEmpty();
+}
+
+void MapPackDlg::importPack(Project *project, QWidget *parent, bool preferCsv)
+{
+    const QString rxpackFilter = QObject::tr("Map packs (*.rxpack)");
+    const QString csvFilter    = QObject::tr("CSV map list (*.csv)");
+    QString selectedFilter     = preferCsv ? csvFilter : rxpackFilter;
     QString path = QFileDialog::getOpenFileName(
         parent, QObject::tr("Import Map Pack"), {},
-        QObject::tr("Map packs (*.rxpack);;All files (*)"));
+        rxpackFilter + QStringLiteral(";;") + csvFilter
+            + QStringLiteral(";;") + QObject::tr("All files (*)"),
+        &selectedFilter);
     if (path.isEmpty()) return;
 
+    const bool isCsv = path.endsWith(QLatin1String(".csv"), Qt::CaseInsensitive);
     QString err;
-    MapPack pack = MapPack::load(path, &err);
+    MapPack pack = isCsv ? MapPack::loadCsv(path, &err)
+                         : MapPack::load(path, &err);
     if (!err.isEmpty()) {
         QMessageBox::warning(parent, QObject::tr("Import failed"), err);
         return;
@@ -84,9 +100,11 @@ void MapPackDlg::importPack(Project *project, QWidget *parent)
     dlg->m_pack       = pack;
     dlg->m_labelEdit->setText(pack.label);
     dlg->m_labelEdit->setReadOnly(true);
-    dlg->m_titleLabel->setText(
-        tr("<b>Import map pack</b>  ·  %1 map(s)  ·  created %2")
-        .arg(pack.maps.size()).arg(pack.created));
+    dlg->m_titleLabel->setText(isCsv
+        ? tr("<b>Import map list (CSV)</b>  ·  %1 map definition(s)")
+          .arg(pack.maps.size())
+        : tr("<b>Import map pack</b>  ·  %1 map(s)  ·  created %2")
+          .arg(pack.maps.size()).arg(pack.created));
     dlg->populateTable(pack);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     dlg->show();
@@ -193,18 +211,21 @@ void MapPackDlg::populateTable(const MapPack &pack)
         m_table->setItem(i, 1, new QTableWidgetItem(e.name));
         m_table->setItem(i, 2, new QTableWidgetItem(
             QString("%1×%2").arg(e.cols).arg(e.rows)));
-        m_table->setItem(i, 3, new QTableWidgetItem(
-            QString("%1B  (%2 bytes)").arg(e.dataSize)
-            .arg(e.data.size())));
+        m_table->setItem(i, 3, new QTableWidgetItem(e.data.isEmpty()
+            ? tr("definition only")
+            : QString("%1B  (%2 bytes)").arg(e.dataSize)
+              .arg(e.data.size())));
     }
 
     m_statusLabel->setText(tr("%1 map(s)  ·  created %2")
                            .arg(pack.maps.size()).arg(pack.created));
 
     // Relabel action button
+    const QString applyLabel = isDefinitionOnly(pack)
+        ? tr("Add selected to project") : tr("Apply selected to ROM");
     for (auto *btn : findChildren<QPushButton *>()) {
         if (btn->property("isActionBtn").toBool())
-            btn->setText(m_exportMode ? tr("Save .rxpack…") : tr("Apply selected to ROM"));
+            btn->setText(m_exportMode ? tr("Save .rxpack…") : applyLabel);
     }
 }
 
@@ -250,13 +271,18 @@ void MapPackDlg::onSave()
     sub.label   = m_labelEdit->text();
     for (int r : rows) sub.maps.append(m_pack.maps[r]);
 
+    QString selectedFilter;
     QString path = QFileDialog::getSaveFileName(
         this, tr("Save Map Pack"), safeFileName(sub.label) + ".rxpack",
-        tr("Map packs (*.rxpack);;All files (*)"));
+        tr("Map packs (*.rxpack);;CSV map list (*.csv);;All files (*)"),
+        &selectedFilter);
     if (path.isEmpty()) return;
 
+    const bool asCsv = path.endsWith(QLatin1String(".csv"), Qt::CaseInsensitive)
+                       || selectedFilter.contains(QLatin1String("*.csv"));
     QString err;
-    if (!sub.save(path, &err))
+    const bool ok = asCsv ? sub.saveCsv(path, &err) : sub.save(path, &err);
+    if (!ok)
         QMessageBox::warning(this, tr("Save failed"), err);
     else
         m_statusLabel->setText(tr("Saved %1 map(s) to %2").arg(rows.size()).arg(path));
@@ -289,28 +315,42 @@ void MapPackDlg::onApply()
         UI::RiskyChangeConfirmDialog::ChangeRow cr;
         cr.label    = e.name;
         cr.oldValue = QStringLiteral("%1×%2").arg(e.cols).arg(e.rows);
-        cr.newValue = QStringLiteral("%1B").arg(e.dataSize);
+        cr.newValue = e.data.isEmpty()
+            ? QStringLiteral("$%1").arg(QString::number(e.address, 16).toUpper())
+            : QStringLiteral("%1B").arg(e.dataSize);
         cr.delta    = QString();
         changeRows.append(cr);
     }
 
+    const bool defOnly = isDefinitionOnly(sub);
+
     UI::RiskyChangeConfirmDialog confirm(this);
-    confirm.setHeadline(tr("Apply map pack: %1").arg(sub.label));
-    confirm.setDescription(tr(
-        "This will overwrite %1 map(s) (%2 cell(s)) in the current ROM. "
-        "A version snapshot will let you revert if needed.")
-        .arg(sub.maps.size()).arg(totalCells));
-    confirm.setRisk(UI::RiskyChangeConfirmDialog::Risk::Caution);
+    if (defOnly) {
+        confirm.setHeadline(tr("Add maps from list: %1").arg(sub.label));
+        confirm.setDescription(tr(
+            "This will add %1 map definition(s) to the project map list. "
+            "ROM bytes are not modified.").arg(sub.maps.size()));
+        confirm.setRisk(UI::RiskyChangeConfirmDialog::Risk::Info);
+        confirm.setSnapshotOption(false);
+        confirm.setActionText(tr("Add"));
+    } else {
+        confirm.setHeadline(tr("Apply map pack: %1").arg(sub.label));
+        confirm.setDescription(tr(
+            "This will overwrite %1 map(s) (%2 cell(s)) in the current ROM. "
+            "A version snapshot will let you revert if needed.")
+            .arg(sub.maps.size()).arg(totalCells));
+        confirm.setRisk(UI::RiskyChangeConfirmDialog::Risk::Caution);
+        confirm.setSnapshotOption(true, true);
+        if (sub.maps.size() > 50)
+            confirm.setRequireTypedConfirmation(QStringLiteral("APPLY"));
+        confirm.setActionText(tr("Apply"));
+    }
     confirm.setChanges(changeRows);
-    confirm.setSnapshotOption(true, true);
-    confirm.setActionText(tr("Apply"));
-    if (sub.maps.size() > 50)
-        confirm.setRequireTypedConfirmation(QStringLiteral("APPLY"));
 
     if (confirm.exec() != QDialog::Accepted)
         return;
 
-    if (confirm.snapshotChecked())
+    if (!defOnly && confirm.snapshotChecked())
         m_project->snapshotVersion(tr("Before map pack: %1").arg(sub.label));
 
     // ── Chunked apply with cancellable progress ───────────────────────────
@@ -353,11 +393,19 @@ void MapPackDlg::onApply()
     for (const MapInfo &mi : m_project->maps)
         existingNames.insert(mi.name);
 
+    int added = 0;
     for (const MapPackEntry &e : sub.maps) {
         if (existingNames.contains(e.name))
             continue;
         if (e.address == 0 && e.mapDataOffset == 0)
             continue;  // no address info — can't place it in the ROM view
+
+        const qint64 end = (qint64)e.address + e.mapDataOffset
+                         + (qint64)e.cols * e.rows * e.dataSize;
+        if (end > m_project->currentData.size()) {
+            warnings << tr("Map outside ROM bounds, not added: %1").arg(e.name);
+            continue;
+        }
 
         MapInfo mi;
         mi.name          = e.name;
@@ -395,15 +443,21 @@ void MapPackDlg::onApply()
 
         m_project->maps.append(mi);
         existingNames.insert(mi.name);
+        ++added;
     }
 
     emit m_project->dataChanged();
 
-    QString msg = tr("Applied %1 map(s).").arg(rows.size() - warnings.size());
+    QString msg = defOnly
+        ? tr("Added %1 map definition(s) to the project.").arg(added)
+        : tr("Applied %1 map(s).").arg(rows.size() - warnings.size());
     if (!warnings.isEmpty())
         msg += tr("\n\nWarnings:\n") + warnings.join('\n');
-    QMessageBox::information(this, tr("Map Pack Applied"), msg);
-    m_statusLabel->setText(tr("Applied %1 map(s) at %2")
-                           .arg(rows.size())
-                           .arg(QDateTime::currentDateTime().toString("hh:mm:ss")));
+    QMessageBox::information(this,
+        defOnly ? tr("Map List Imported") : tr("Map Pack Applied"), msg);
+    m_statusLabel->setText(defOnly
+        ? tr("Added %1 map(s) at %2").arg(added)
+              .arg(QDateTime::currentDateTime().toString("hh:mm:ss"))
+        : tr("Applied %1 map(s) at %2").arg(rows.size())
+              .arg(QDateTime::currentDateTime().toString("hh:mm:ss")));
 }

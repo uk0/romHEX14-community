@@ -70,6 +70,12 @@ struct MapPack {
     bool save(const QString &path, QString *error = nullptr) const;
     static MapPack load(const QString &path, QString *error = nullptr);
 
+    // CSV map list interchange ("Address;Name;Size", as exported by OLS-style
+    // tools).  Parsed entries are definition-only: geometry + address but no
+    // cell data — applying them registers the maps without touching ROM bytes.
+    bool saveCsv(const QString &path, QString *error = nullptr) const;
+    static MapPack loadCsv(const QString &path, QString *error = nullptr);
+
     // Apply to a writable ROM buffer.
     QStringList apply(QByteArray &rom,
                       const QVector<MapInfo> &projectMaps,
