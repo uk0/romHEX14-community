@@ -34,6 +34,7 @@ struct MapAutoDetectOptions {
     int  minScore1D              = 65;     ///< drop 1D curves below this
     int  maxCandidatesPerRegion  = 20000;
     int  maxAxesPerRegion        = 2048;   ///< cap axis-search work per cell-type
+    int  topN                    = 0;      ///< keep only the N best-scoring candidates (0 = unlimited)
 };
 
 class MapAutoDetect {

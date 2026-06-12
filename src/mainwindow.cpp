@@ -3619,6 +3619,7 @@ void MainWindow::runMapAutoDetectOnImport(Project *project)
     QFuture<QVector<ols::MapCandidate>> fut = QtConcurrent::run(
         [rom, base]() {
             ols::MapAutoDetectOptions opts;
+            opts.topN = 500;   // strict mode: don't flood the overlay list (#25)
             return ols::MapAutoDetect::scan(rom, base, opts);
         });
     watcher->setFuture(fut);
@@ -7533,6 +7534,7 @@ void MainWindow::actAutoDetectMaps()
     QFuture<QVector<ols::MapCandidate>> fut = QtConcurrent::run(
         [romBytes, baseAddr]() {
             ols::MapAutoDetectOptions opts;
+            opts.topN = 500;   // strict mode: top candidates only (#25)
             return ols::MapAutoDetect::scan(romBytes, baseAddr, opts);
         });
     watcher.setFuture(fut);

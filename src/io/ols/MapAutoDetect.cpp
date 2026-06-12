@@ -291,7 +291,13 @@ static double scoreShapePrior1D(int n)
     double s = 0.0;
     if (n == 8 || n == 10 || n == 12 || n == 14 || n == 16) s += 4.0;
     else if (n >= 8 && n <= 32) s += 2.0;
-    if (n < 8) s -= 8.0;
+    // kMinAxisLen is back at 5 so short limiter curves and 6-7 point
+    // gear-ratio tables stay findable; instead of a hard length floor,
+    // tiny axes pay a stiff penalty that only really clean candidates
+    // (high axis + smoothness score) can climb over.
+    if      (n == 5) s -= 12.0;
+    else if (n == 6) s -= 10.0;
+    else if (n == 7) s -= 8.0;
     return s;
 }
 
@@ -326,7 +332,10 @@ QVector<MapCandidate> MapAutoDetect::scan(const QByteArray &rom,
     QVector<MapCandidate> result;
     if (rom.size() < 64) return result;
 
-    constexpr int kMinAxisLen = 8;
+    // 5, not 8: real short curves exist (5-point limiters, 6-7 entry
+    // gear-ratio tables in BMW EDC17 etc.). Tiny-axis noise is handled by
+    // the length penalty in scoreShapePrior1D instead of a hard floor.
+    constexpr int kMinAxisLen = 5;
     constexpr int kMaxAxisLen = 96;
     constexpr int kMaxPairGap = 256;
 
@@ -501,6 +510,18 @@ QVector<MapCandidate> MapAutoDetect::scan(const QByteArray &rom,
 
     if (result.size() > opts.maxCandidatesPerRegion)
         result.resize(opts.maxCandidatesPerRegion);
+
+    // Strict mode (issue #25): keep only the N best-scoring candidates so
+    // the auto-detected list isn't flooded by everything above minScore.
+    // suppressOverlaps() returns its survivors in descending score order,
+    // so a plain truncation keeps the best.
+    if (opts.topN > 0 && result.size() > opts.topN) {
+        std::sort(result.begin(), result.end(),
+                  [](const MapCandidate &a, const MapCandidate &b) {
+                      return a.score > b.score;
+                  });
+        result.resize(opts.topN);
+    }
 
     return result;
 }

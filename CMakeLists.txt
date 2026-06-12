@@ -510,3 +510,21 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
         target_compile_options(rx14 PRIVATE -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2)
     endif()
 endif()
+
+# ── Map auto-detect corpus harness (issue #25) ─────────────────────────────
+# Prints precision/recall over labelled ROMs in testdata/mapdetect so prior
+# tuning in MapAutoDetect.cpp can be tracked run-over-run.
+add_executable(test_mapdetect_corpus tests/test_mapdetect_corpus.cpp
+    src/io/ols/MapAutoDetect.cpp
+    src/io/ols/KpImporter.cpp
+    src/io/ols/ZipDecompressor.cpp
+)
+target_include_directories(test_mapdetect_corpus PRIVATE src)
+target_compile_definitions(test_mapdetect_corpus PRIVATE
+    TESTDATA_DIR="${CMAKE_SOURCE_DIR}/testdata")
+target_link_libraries(test_mapdetect_corpus PRIVATE Qt6::Core Qt6::Gui)
+if(ZLIB_FOUND)
+    target_link_libraries(test_mapdetect_corpus PRIVATE ZLIB::ZLIB)
+else()
+    target_link_libraries(test_mapdetect_corpus PRIVATE z)
+endif()
