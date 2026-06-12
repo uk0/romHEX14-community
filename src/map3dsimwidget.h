@@ -32,6 +32,8 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void leaveEvent(QEvent *event) override;
 
 private:
     struct Vec3 { double x, y, z; };
@@ -53,6 +55,17 @@ private:
     void updateValueLabel();
 
     double interpZ(double normX, double normY) const;
+
+    // ── Cursor-cell sync (3D surface ⇄ mini heatmap), issue #22 ─────────
+    int  cursorRow() const;
+    int  cursorCol() const;
+    void setCursorCell(int row, int col);
+    void setCursorNorm(double normX, double normY);
+    bool pickSurfaceCell(const QPoint &pos, int &row, int &col) const;
+    bool pickSurfacePos(const QPoint &pos, double *normX, double *normY) const;
+    void selectFromMini(const QPoint &pos);
+    QPointF crosshairScreenPos() const;
+    const QVector<QPointF> &projectedVertices() const;
 
     // Data
     QByteArray m_data;
@@ -81,6 +94,18 @@ private:
     // Interaction
     bool   m_rotating = false;
     QPoint m_lastMouse;
+
+    // Cursor-cell sync state
+    QRect  m_miniRect;             // heatmap area inside the minimap panel (set during paint)
+    bool   m_miniDragging = false; // left-drag scrubbing on the minimap
+    bool   m_maybeClick   = false; // press that hasn't turned into a rotate-drag yet
+    QPoint m_pressPos;
+    int    m_hoverRow = -1, m_hoverCol = -1;  // transient hover highlight (-1 = none)
+
+    // Screen-space vertex cache so hover/click picking never re-projects the
+    // grid per mouse-move. Invalidated on rotate/zoom/resize/grid changes.
+    mutable QVector<QPointF> m_projCache;
+    mutable bool m_projDirty = true;
 
     // Controls
     QSlider *m_sliderX = nullptr;

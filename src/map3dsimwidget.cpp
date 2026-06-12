@@ -89,19 +89,209 @@ Map3DSimWidget::Map3DSimWidget(QWidget *parent)
 void Map3DSimWidget::updateValueLabel()
 {
     if (!m_hasData || m_cols < 1 || m_rows < 1) return;
-    int col = qBound(0, (int)(m_crossX * (m_cols - 1) + 0.5), m_cols - 1);
-    int row = qBound(0, (int)(m_crossY * (m_rows - 1) + 0.5), m_rows - 1);
+    int col = cursorCol();
+    int row = cursorRow();
     double val = m_grid[row][col];
     QString xL = col < m_xAxis.size() ? QString::number(m_xAxis[col], 'f', 1) : QString::number(col);
     QString yL = row < m_yAxis.size() ? QString::number(m_yAxis[row], 'f', 1) : QString::number(row);
-    m_labelValue->setText(QString("X: %1  |  Y: %2  |  Z: %3").arg(xL, yL, QString::number(val, 'f', 2)));
+
+    // Shared status line: (row, col) · address · raw · scaled · unit (#22)
+    int cs  = m_map.dataSize;
+    int idx = m_map.columnMajor ? col * m_rows + row : row * m_cols + col;
+    qint64 off = (qint64)m_map.address + m_map.mapDataOffset + (qint64)idx * cs;
+    QString addr = QStringLiteral("$%1").arg(
+        QString::number((quint64)off, 16).toUpper());
+
+    quint32 raw = 0;
+    if (off >= 0 && off + cs <= m_data.size()) {
+        const uchar *d = reinterpret_cast<const uchar *>(m_data.constData());
+        if (m_byteOrder == ByteOrder::BigEndian)
+            for (int b = 0; b < cs; b++) raw = (raw << 8) | d[off + b];
+        else
+            for (int b = cs - 1; b >= 0; b--) raw = (raw << 8) | d[off + b];
+    }
+
+    QString zu = m_map.scaling.unit;
+    m_labelValue->setText(
+        QString("(%1, %2)  ·  %3  ·  raw %4  ·  %5%6   |   X %7  ·  Y %8")
+            .arg(row).arg(col).arg(addr).arg(raw)
+            .arg(QString::number(val, 'f', 2),
+                 zu.isEmpty() ? QString() : QStringLiteral(" ") + zu,
+                 xL, yL));
     emit cellHovered(row, col, val);
+}
+
+int Map3DSimWidget::cursorCol() const
+{
+    return qBound(0, (int)(m_crossX * (m_cols - 1) + 0.5), m_cols - 1);
+}
+
+int Map3DSimWidget::cursorRow() const
+{
+    return qBound(0, (int)(m_crossY * (m_rows - 1) + 0.5), m_rows - 1);
+}
+
+void Map3DSimWidget::setCursorNorm(double normX, double normY)
+{
+    if (!m_hasData || m_cols < 1 || m_rows < 1) return;
+    m_crossX = qBound(0.0, normX, 1.0);
+    m_crossY = qBound(0.0, normY, 1.0);
+    if (m_sliderX) {
+        QSignalBlocker bx(m_sliderX);
+        m_sliderX->setValue((int)(m_crossX * 1000 + 0.5));
+    }
+    if (m_sliderY) {
+        QSignalBlocker by(m_sliderY);
+        m_sliderY->setValue((int)(m_crossY * 1000 + 0.5));
+    }
+    update();
+    updateValueLabel();
+}
+
+void Map3DSimWidget::setCursorCell(int row, int col)
+{
+    if (!m_hasData || m_cols < 1 || m_rows < 1) return;
+    row = qBound(0, row, m_rows - 1);
+    col = qBound(0, col, m_cols - 1);
+    setCursorNorm((m_cols > 1) ? (double)col / (m_cols - 1) : 0.5,
+                  (m_rows > 1) ? (double)row / (m_rows - 1) : 0.5);
+}
+
+QPointF Map3DSimWidget::crosshairScreenPos() const
+{
+    double cx = -1.0 + 2.0 * m_crossX;
+    double cy = -1.0 + 2.0 * m_crossY;
+    Pt2 top = project(cx, cy, interpZ(m_crossX, m_crossY));
+    return QPointF(top.x, top.y);
+}
+
+// Invert the bilinear patch P(u,v) = mix of the quad corners for screen
+// point p — a few Newton steps converge for the near-parallelogram faces
+// the projection produces.
+static void invBilinear(const QPointF &p, const QPointF &a, const QPointF &b,
+                        const QPointF &c, const QPointF &d, double *u, double *v)
+{
+    double uu = 0.5, vv = 0.5;
+    for (int i = 0; i < 8; i++) {
+        QPointF P = (1-uu)*(1-vv)*a + uu*(1-vv)*b + uu*vv*c + (1-uu)*vv*d;
+        QPointF r = P - p;
+        QPointF Pu = (1-vv)*(b-a) + vv*(c-d);
+        QPointF Pv = (1-uu)*(d-a) + uu*(c-b);
+        const double det = Pu.x()*Pv.y() - Pu.y()*Pv.x();
+        if (qAbs(det) < 1e-9) break;
+        uu -= ( r.x()*Pv.y() - r.y()*Pv.x()) / det;
+        vv -= (-r.x()*Pu.y() + r.y()*Pu.x()) / det;
+    }
+    *u = qBound(0.0, uu, 1.0);
+    *v = qBound(0.0, vv, 1.0);
+}
+
+const QVector<QPointF> &Map3DSimWidget::projectedVertices() const
+{
+    if (m_projDirty) {
+        const double range = m_maxVal - m_minVal;
+        m_projCache.resize(m_rows * m_cols);
+        for (int r = 0; r < m_rows; r++) {
+            for (int c = 0; c < m_cols; c++) {
+                double x = -1.0 + 2.0 * c / (m_cols - 1);
+                double y = -1.0 + 2.0 * r / (m_rows - 1);
+                double z = (m_grid[r][c] - m_minVal) / range * kZScale;
+                Pt2 pt = project(x, y, z);
+                m_projCache[r * m_cols + c] = QPointF(pt.x, pt.y);
+            }
+        }
+        m_projDirty = false;
+    }
+    return m_projCache;
+}
+
+// Map a screen position to a continuous (normX, normY) on the surface.
+// Hit-tests the projected faces (front-most wins, same depth rule as the
+// painter's back-to-front sort), then inverts the face's bilinear patch so
+// the result tracks the mouse exactly — this is what makes dragging the
+// crosshair dot feel glued to the pointer.
+bool Map3DSimWidget::pickSurfacePos(const QPoint &pos, double *normX, double *normY) const
+{
+    if (!m_hasData || m_cols < 2 || m_rows < 2) return false;
+    const QPointF fp(pos);
+    const QVector<QPointF> &proj = projectedVertices();
+    if (proj.size() != m_rows * m_cols) return false;
+
+    double bestDepth = -1e18;
+    bool foundFace = false;
+    int fr = 0, fc = 0;
+    for (int r = 0; r < m_rows - 1; r++) {
+        for (int c = 0; c < m_cols - 1; c++) {
+            const QPointF &p00 = proj[r * m_cols + c];
+            const QPointF &p10 = proj[r * m_cols + c + 1];
+            const QPointF &p11 = proj[(r+1) * m_cols + c + 1];
+            const QPointF &p01 = proj[(r+1) * m_cols + c];
+            // Cheap bbox reject before any allocation — this runs per mouse-move.
+            if (fp.x() < qMin(qMin(p00.x(), p10.x()), qMin(p11.x(), p01.x()))
+                || fp.x() > qMax(qMax(p00.x(), p10.x()), qMax(p11.x(), p01.x()))
+                || fp.y() < qMin(qMin(p00.y(), p10.y()), qMin(p11.y(), p01.y()))
+                || fp.y() > qMax(qMax(p00.y(), p10.y()), qMax(p11.y(), p01.y())))
+                continue;
+            QPolygonF quad;
+            quad << p00 << p10 << p11 << p01;
+            if (!quad.containsPoint(fp, Qt::OddEvenFill)) continue;
+            const double depth = (p00.y() + p10.y() + p11.y() + p01.y()) / 4.0;
+            if (depth > bestDepth) { bestDepth = depth; fr = r; fc = c; foundFace = true; }
+        }
+    }
+    if (!foundFace) return false;
+
+    double u = 0.5, v = 0.5;
+    invBilinear(fp,
+                proj[fr * m_cols + fc],       proj[fr * m_cols + fc + 1],
+                proj[(fr+1) * m_cols + fc+1], proj[(fr+1) * m_cols + fc],
+                &u, &v);
+    *normX = (fc + u) / (m_cols - 1);
+    *normY = (fr + v) / (m_rows - 1);
+    return true;
+}
+
+// Cell-snapped variant of pickSurfacePos, with a vertex-radius fallback for
+// clicks just off the surface edge.
+bool Map3DSimWidget::pickSurfaceCell(const QPoint &pos, int &row, int &col) const
+{
+    if (!m_hasData || m_cols < 2 || m_rows < 2) return false;
+    double nx = 0, ny = 0;
+    if (pickSurfacePos(pos, &nx, &ny)) {
+        col = qBound(0, (int)(nx * (m_cols - 1) + 0.5), m_cols - 1);
+        row = qBound(0, (int)(ny * (m_rows - 1) + 0.5), m_rows - 1);
+        return true;
+    }
+
+    const QPointF fp(pos);
+    const QVector<QPointF> &proj = projectedVertices();
+    constexpr double kPickRadius = 18.0;
+    double best = kPickRadius * kPickRadius;
+    bool found = false;
+    for (int r = 0; r < m_rows; r++) {
+        for (int c = 0; c < m_cols; c++) {
+            const QPointF d = proj[r * m_cols + c] - fp;
+            const double d2 = d.x() * d.x() + d.y() * d.y();
+            if (d2 < best) { best = d2; row = r; col = c; found = true; }
+        }
+    }
+    return found;
+}
+
+void Map3DSimWidget::selectFromMini(const QPoint &pos)
+{
+    if (m_miniRect.width() < 1 || m_miniRect.height() < 1) return;
+    double tx = (pos.x() - m_miniRect.x()) / (double)m_miniRect.width();
+    double ty = (pos.y() - m_miniRect.y()) / (double)m_miniRect.height();
+    int col = qBound(0, (int)(tx * m_cols), m_cols - 1);
+    int row = qBound(0, (int)(ty * m_rows), m_rows - 1);
+    setCursorCell(row, col);
 }
 
 void Map3DSimWidget::showMap(const QByteArray &romData, const MapInfo &map, ByteOrder byteOrder)
 {
     m_data = romData; m_map = map; m_byteOrder = byteOrder; m_hasData = true;
-    rebuildGrid(); update();
+    rebuildGrid(); m_projDirty = true; update();
 }
 
 void Map3DSimWidget::clear() { m_hasData = false; m_grid.clear(); m_cols = m_rows = 0; update(); }
@@ -667,6 +857,18 @@ void Map3DSimWidget::drawCrosshair(QPainter &p)
     // Shadow dot on base
     p.setBrush(QColor(255, 220, 50, 50));
     p.drawEllipse(QPointF(base.x, base.y), 5, 5);
+
+    // Transient hover marker on the surface (white ring, no fill)
+    if (m_hoverRow >= 0 && m_hoverCol >= 0) {
+        double range = m_maxVal - m_minVal;
+        double hx = -1.0 + 2.0 * m_hoverCol / (m_cols - 1);
+        double hy = -1.0 + 2.0 * m_hoverRow / (m_rows - 1);
+        double hz = (m_grid[m_hoverRow][m_hoverCol] - m_minVal) / range * kZScale;
+        Pt2 pt = project(hx, hy, hz);
+        p.setPen(QPen(QColor(255, 255, 255, 180), 1.5));
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(QPointF(pt.x, pt.y), 6, 6);
+    }
 }
 
 // ── Axes ───────────────────────────────────────────────────────────────────
@@ -865,6 +1067,31 @@ void Map3DSimWidget::drawMiniHeatmap(QPainter &p)
     p.setBrush(Qt::NoBrush);
     p.drawRect(hx, hy, mapW, mapH);
 
+    // Remember the heatmap area for mouse hit-testing (cursor sync, #22)
+    m_miniRect = QRect(hx, hy, mapW, mapH);
+
+    // Selected-cell outline
+    {
+        int col = qBound(0, (int)(m_crossX * (m_cols - 1) + 0.5), m_cols - 1);
+        int row = qBound(0, (int)(m_crossY * (m_rows - 1) + 0.5), m_rows - 1);
+        QRectF cell(hx + col * cellW, hy + row * cellH,
+                    qMax(cellW, 2.0), qMax(cellH, 2.0));
+        p.setPen(QPen(QColor(255, 220, 50, 230), 1.5));
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(cell);
+    }
+
+    // Hover-cell outline (transient)
+    if (m_hoverRow >= 0 && m_hoverCol >= 0
+        && (m_hoverRow != qBound(0, (int)(m_crossY * (m_rows - 1) + 0.5), m_rows - 1)
+            || m_hoverCol != qBound(0, (int)(m_crossX * (m_cols - 1) + 0.5), m_cols - 1))) {
+        QRectF cell(hx + m_hoverCol * cellW, hy + m_hoverRow * cellH,
+                    qMax(cellW, 2.0), qMax(cellH, 2.0));
+        p.setPen(QPen(QColor(255, 255, 255, 150), 1.0));
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(cell);
+    }
+
     // Crosshair lines on minimap
     double dotX = hx + m_crossX * mapW;
     double dotY = hy + m_crossY * mapH;
@@ -955,28 +1182,132 @@ void Map3DSimWidget::drawMiniHeatmap(QPainter &p)
 void Map3DSimWidget::mousePressEvent(QMouseEvent *e)
 {
     m_lastMouse = e->pos();
+    m_pressPos  = e->pos();
     if (e->button() == Qt::LeftButton) {
-        m_rotating = true;
+        // Click/drag on the mini heatmap selects cells, never rotates.
+        if (m_hasData && m_miniRect.contains(e->pos())) {
+            m_miniDragging = true;
+            selectFromMini(e->pos());
+            return;
+        }
+        // Grab the yellow crosshair dot: dragging it slides the selection
+        // along the surface instead of rotating the view.
+        if (m_hasData && m_cols >= 2 && m_rows >= 2) {
+            const QPointF d = QPointF(e->pos()) - crosshairScreenPos();
+            if (d.x() * d.x() + d.y() * d.y() <= 14.0 * 14.0) {
+                m_crossDragging = true;
+                setCursor(Qt::ClosedHandCursor);
+                return;
+            }
+        }
+        m_rotating   = true;
+        m_maybeClick = true;   // becomes a cell-pick if released without dragging
         setCursor(Qt::ClosedHandCursor);
     }
 }
 
 void Map3DSimWidget::mouseMoveEvent(QMouseEvent *e)
 {
+    if (m_miniDragging) {
+        selectFromMini(e->pos());
+        return;
+    }
+    if (m_crossDragging) {
+        double nx = 0, ny = 0;
+        if (pickSurfacePos(e->pos(), &nx, &ny))
+            setCursorNorm(nx, ny);   // off-surface moves keep the last position
+        return;
+    }
     if (m_rotating) {
+        if ((e->pos() - m_pressPos).manhattanLength() > 4)
+            m_maybeClick = false;
         QPoint delta = e->pos() - m_lastMouse;
         m_rotZ += delta.x() * 0.4;
         m_rotX += delta.y() * 0.3;
         m_rotX = qBound(-85.0, m_rotX, -5.0);
         m_lastMouse = e->pos();
+        m_projDirty = true;
         update();
+        return;
+    }
+
+    // Hover (no buttons). Only minimap hover shows the transient highlight —
+    // it implies a repaint of the whole scene, which is fine for a deliberate
+    // visit to the minimap but would cause a repaint storm (and janky drags)
+    // if it fired while sweeping across the 3D surface. Surface hover just
+    // updates the cursor, using the cached projection.
+    if (m_hasData && m_cols >= 2 && m_rows >= 2) {
+        if (m_miniRect.contains(e->pos())) {
+            double tx = (e->pos().x() - m_miniRect.x()) / (double)m_miniRect.width();
+            double ty = (e->pos().y() - m_miniRect.y()) / (double)m_miniRect.height();
+            int hc = qBound(0, (int)(tx * m_cols), m_cols - 1);
+            int hr = qBound(0, (int)(ty * m_rows), m_rows - 1);
+            setCursor(Qt::PointingHandCursor);
+            if (hr != m_hoverRow || hc != m_hoverCol) {
+                m_hoverRow = hr;
+                m_hoverCol = hc;
+                update();
+            }
+        } else {
+            const QPointF d = QPointF(e->pos()) - crosshairScreenPos();
+            if (d.x() * d.x() + d.y() * d.y() <= 14.0 * 14.0) {
+                setCursor(Qt::OpenHandCursor);   // the dot is grabbable
+            } else {
+                int hr = -1, hc = -1;
+                pickSurfaceCell(e->pos(), hr, hc);
+                setCursor(hr >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
+            }
+            if (m_hoverRow != -1 || m_hoverCol != -1) {
+                m_hoverRow = m_hoverCol = -1;   // leaving the minimap clears its highlight
+                update();
+            }
+        }
     }
 }
 
-void Map3DSimWidget::mouseReleaseEvent(QMouseEvent *)
+void Map3DSimWidget::mouseReleaseEvent(QMouseEvent *e)
 {
-    m_rotating = false;
-    setCursor(Qt::ArrowCursor);
+    if (m_miniDragging) {
+        m_miniDragging = false;
+        return;
+    }
+    if (m_crossDragging) {
+        m_crossDragging = false;
+        setCursor(Qt::OpenHandCursor);
+        return;
+    }
+    if (m_rotating) {
+        m_rotating = false;
+        setCursor(Qt::ArrowCursor);
+        // A press that never moved: pick the cell under the click on the
+        // 3D surface and sync both panes to it (#22).
+        if (m_maybeClick
+            && (e->pos() - m_pressPos).manhattanLength() <= 4) {
+            int row = 0, col = 0;
+            if (pickSurfaceCell(e->pos(), row, col))
+                setCursorCell(row, col);
+        }
+        m_maybeClick = false;
+    }
+}
+
+void Map3DSimWidget::keyPressEvent(QKeyEvent *e)
+{
+    if (!m_hasData || m_cols < 1 || m_rows < 1) {
+        QWidget::keyPressEvent(e);
+        return;
+    }
+    int row = cursorRow(), col = cursorCol();
+    switch (e->key()) {
+    case Qt::Key_Left:  setCursorCell(row, col - 1); break;
+    case Qt::Key_Right: setCursorCell(row, col + 1); break;
+    case Qt::Key_Up:    setCursorCell(row - 1, col); break;
+    case Qt::Key_Down:  setCursorCell(row + 1, col); break;
+    default:
+        QWidget::keyPressEvent(e);
+        return;
+    }
+    e->accept();
 }
 
 void Map3DSimWidget::wheelEvent(QWheelEvent *e)
@@ -984,6 +1315,7 @@ void Map3DSimWidget::wheelEvent(QWheelEvent *e)
     double delta = e->angleDelta().y() / 120.0;
     m_zoom *= (1.0 + delta * 0.1);
     m_zoom = qBound(0.3, m_zoom, 5.0);
+    m_projDirty = true;
     update();
 }
 
@@ -991,4 +1323,13 @@ void Map3DSimWidget::resizeEvent(QResizeEvent *)
 {
     auto *cb = findChild<QWidget *>("controlBar");
     if (cb) cb->setGeometry(0, height() - 70, width(), 70);
+    m_projDirty = true;
+}
+
+void Map3DSimWidget::leaveEvent(QEvent *)
+{
+    if (m_hoverRow >= 0 || m_hoverCol >= 0) {
+        m_hoverRow = m_hoverCol = -1;
+        update();
+    }
 }
