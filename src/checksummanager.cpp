@@ -1,16 +1,14 @@
-/*
- * This file is part of romHEX14.
- * Copyright (C) 2026 Cristian Tabuyo <contact@romhex14.com>
- * SPDX-License-Identifier: GPL-3.0-or-later
- */
-
 #include "checksummanager.h"
+#include "checksums/BoschMED17.h"
+#include "checksums/IChecksumPlugin.h"
 #include <QCoreApplication>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPluginLoader>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QTemporaryFile>
@@ -28,6 +26,7 @@ ChecksumManager* ChecksumManager::instance() {
 
 ChecksumManager::ChecksumManager(QObject* parent) : QObject(parent) {
     buildRegistry();
+    loadPlugins();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,7 +192,7 @@ void ChecksumManager::buildRegistry() {
         info.devNum      = d.n;
         info.description = QString::fromLatin1(d.desc);
         info.filename    = QString("DEV%1.dll").arg(d.n, 3, 10, QChar('0'));
-        info.hasNative   = false; // community: native implementations are pro-only
+        info.hasNative   = d.native;
         m_dlls.append(info);
     }
 }
@@ -227,12 +226,12 @@ ChecksumDllInfo ChecksumManager::findDllForEcu(const QString& ecuType) const {
         // ECU family keywords — bonus for exact family match
         static const struct { const char* key; int bonus; } kFamilies[] = {
             {"EDC17", 50}, {"EDC16", 50}, {"EDC15", 50},
-            {"MED17", 50}, {"MED9", 40},  {"MED7", 40},
+            {"MED17", 80}, {"MEDVC17", 100}, {"MED9", 40},  {"MED7", 40},
             {"ME7",   40}, {"ME9",  40},  {"ME2",  40},
             {"SIMOS", 40}, {"PCR",  30},  {"PPD",  30},
             {"SID",   30}, {"MSS",  30},  {"MSV",  30}, {"MSD", 30},
             {"MS41",  35}, {"MS45", 35},  {"BMS",  30},
-            {"TC1797",40}, {"TC176",40},  {"MPC55",35},
+            {"TC1797",40}, {"TC1793",80}, {"TC179", 70}, {"TC176",70}, {"MPC55",35},
             {nullptr, 0}
         };
         for (int i = 0; kFamilies[i].key; i++) {
@@ -240,11 +239,15 @@ ChecksumDllInfo ChecksumManager::findDllForEcu(const QString& ecuType) const {
             if (q.contains(k) && desc.contains(k)) score += kFamilies[i].bonus;
         }
 
-        // Penalise if description is for a totally different brand
+        // DEV094 is the primary ALL BRAND algorithm for MEDVC17 / MED17 / EDC17 / TC179x / TC176x / TC172x
+        if (dll.devNum == 94 && (q.contains("MED17") || q.contains("EDC17") || q.contains("TC179") || q.contains("TC176") || q.contains("TC172") || q.contains("MEDVC17"))) {
+            score += 200;
+        }
+
+        // Penalise if description is for a specific heavy machinery brand when query is general
         static const QStringList kBrands = {"BOSCH","SIEMENS","DELPHI","DENSO",
                                              "MARELLI","MOTOROLA","CONTINENTAL","VISTEON",
                                              "LUCAS","SAGEM","VALEO"};
-        // If user typed a brand name and it's NOT in this description, penalise
         for (const QString& brand : kBrands) {
             if (q.contains(brand) && !desc.contains(brand)) score -= 20;
         }
@@ -263,7 +266,8 @@ ChecksumDllInfo ChecksumManager::findDllForEcu(const QString& ecuType) const {
 static QString scanRomForEcuType(const QByteArray& rom) {
     // ECU families to look for in embedded ASCII strings, ordered by specificity
     static const struct { const char* pat; int priority; } kPatterns[] = {
-        {"MED17",  100}, {"EDC17",  100}, {"MED9.",   90}, {"MED7.",   90},
+        {"MED17",  100}, {"EDC17",  100}, {"MEDVC17", 110}, {"TC1793", 105}, {"TC1797", 100},
+        {"MED9.",   90}, {"MED7.",   90},
         {"EDC16+",  95}, {"EDC16C",  95}, {"EDC16",   85},
         {"EDC15C",  90}, {"EDC15P",  90}, {"EDC15V",  90}, {"EDC15",   80},
         {"ME9.",    85}, {"ME7.",    85}, {"ME2.",     80},
@@ -274,7 +278,7 @@ static QString scanRomForEcuType(const QByteArray& rom) {
         {"SID208",  75}, {"SID20",   70}, {"SID80",   70}, {"SID",     60},
         {"BMS46",   75}, {"BMS",     60},
         {"MS45",    75}, {"MS41",    75},
-        {"TC1797",  85}, {"TC1767",  85}, {"TC176",   80},
+        {"TC1767",  85}, {"TC176",   80},
         {nullptr,    0}
     };
 
@@ -455,6 +459,51 @@ bool ChecksumManager::isHelperAvailable() const {
 #endif
 }
 
+QStringList ChecksumManager::pluginSearchPaths() const {
+    QStringList paths;
+    const QString appDir = QCoreApplication::applicationDirPath();
+    paths << appDir + "/plugins/checksums";
+    paths << appDir + "/../plugins/checksums";
+    paths << appDir + "/plugins";
+    paths << QDir::cleanPath(appDir + "/../../plugins/checksums");
+    paths << QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/checksums";
+    return paths;
+}
+
+void ChecksumManager::loadPlugins() {
+    const QStringList searchDirs = pluginSearchPaths();
+    for (const QString& dirPath : searchDirs) {
+        if (!QDir(dirPath).exists()) continue;
+
+        QDirIterator it(dirPath, QStringList() << "*.so" << "*.dylib" << "*.dll",
+                        QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString pluginFile = it.next();
+            QPluginLoader loader(pluginFile);
+            QObject* instance = loader.instance();
+            if (!instance) continue;
+
+            auto* plugin = qobject_cast<Checksum::IChecksumPlugin*>(instance);
+            if (!plugin) {
+                // Fallback for non-qobject or static cast
+                plugin = dynamic_cast<Checksum::IChecksumPlugin*>(instance);
+            }
+            if (plugin) {
+                const uint32_t dNum = plugin->devNum();
+                m_plugins[dNum] = plugin;
+
+                // Update registry info
+                for (auto& info : m_dlls) {
+                    if (static_cast<uint32_t>(info.devNum) == dNum) {
+                        info.hasNative = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 32-bit DLL bridge (Windows only)
@@ -605,6 +654,20 @@ ChecksumResult ChecksumManager::verify(const QByteArray& rom, const ChecksumDllI
         errorMsg = tr("Unknown ECU \u2014 no checksum DLL matched");
         return ChecksumResult::Unsupported;
     }
+    // 1. Dynamic Checksum Plugin
+    if (m_plugins.contains(dll.devNum) && m_plugins[dll.devNum]) {
+        int r = m_plugins[dll.devNum]->verify(rom, errorMsg);
+        if (r == 0) return ChecksumResult::OK;
+        if (r == 1) return ChecksumResult::Mismatch;
+        return ChecksumResult::Error;
+    }
+    // 2. Built-in C++ Native Engine Fallback
+    if (dll.devNum == 94) {
+        Checksum::BoschMED17::Status st = Checksum::BoschMED17::verify(rom, errorMsg);
+        if (st == Checksum::BoschMED17::Status::OK) return ChecksumResult::OK;
+        if (st == Checksum::BoschMED17::Status::Mismatch) return ChecksumResult::Mismatch;
+        return ChecksumResult::Error;
+    }
 #ifdef Q_OS_WIN
     // Windows: use the vendor DLL bridge (checksumhelper.exe + vendor DLLs).
     if (isHelperAvailable() && isDllAvailable(dll))
@@ -624,6 +687,19 @@ ChecksumResult ChecksumManager::correct(QByteArray& rom, const ChecksumDllInfo& 
     if (dll.devNum == 0) {
         errorMsg = tr("Unknown ECU \u2014 no checksum DLL matched");
         return ChecksumResult::Unsupported;
+    }
+    // 1. Dynamic Checksum Plugin
+    if (m_plugins.contains(dll.devNum) && m_plugins[dll.devNum]) {
+        int r = m_plugins[dll.devNum]->correct(rom, errorMsg);
+        if (r == 0) return ChecksumResult::OK;
+        return ChecksumResult::Error;
+    }
+    // 2. Built-in C++ Native Engine Fallback
+    if (dll.devNum == 94) {
+        Checksum::BoschMED17::Status st = Checksum::BoschMED17::correct(rom, errorMsg);
+        if (st == Checksum::BoschMED17::Status::OK) return ChecksumResult::OK;
+        if (st == Checksum::BoschMED17::Status::Mismatch) return ChecksumResult::Mismatch;
+        return ChecksumResult::Error;
     }
 #ifdef Q_OS_WIN
     if (isHelperAvailable() && isDllAvailable(dll))
